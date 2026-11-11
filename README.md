@@ -96,6 +96,34 @@ flight when a cap is reached still finish, so spend can overshoot by up to `conc
 Samples skipped because the budget ran out get a result row (`error: budget exhausted`) and are
 reported as `skipped_budget`, not as errors.
 
+## Run-level A/B (agents)
+
+A recorded call of an agent can't be scored by task outcome (the project state at call time isn't recorded),
+so compare policies per run: `wrapper ab` starts the caller's own command N times per arm, each arm under its
+own policy, and compares success rate and cost per successful run.
+
+```yaml
+id: fastlanes-ab
+command: ["bash", "run.sh", "{run_dir}", "{policy}"]     # also {arm}, {i}; run without a shell
+arms:                                                      # first = control
+  - {id: deepseek, policy: policies/base.yaml}
+  - {id: luna, policy: policies/base.yaml, overlays: [policies/luna_default.yaml]}
+runs: 5
+success: {stdout_regex: "^Success: True"}                  # or {exit_code: 0}
+timeout_s: 1800
+budget_usd: 1.5
+```
+```bash
+.venv/bin/wrapper --db ab.db ab run spec.yaml      # interleaves arms; progress on stderr, report at the end
+.venv/bin/wrapper --db ab.db ab report fastlanes-ab
+```
+Each run gets `WRAPPER_POLICY` (the arm's effective policy; `${ENV:...}` secrets stay unresolved in the file),
+`WRAPPER_DB` and `WRAPPER_RUN_TAG`, which the gateway stamps on every request row (`requests.run_tag`), so a run's
+calls and cost are found by tag. The report gives a Wilson 95% interval for each arm's success rate, cost per run
+and per successful run, and a bootstrap CI for the success-rate difference against the control. A timeout counts
+as a failed run; runs skipped by `budget_usd` are not failures. `examples/cppagent_ab/` has a ready spec for cppagent
+(not run: it calls real models). A spec runs your command: only run specs you trust.
+
 ### Prompt and context arms
 
 Besides the model and params, an arm can change the prompt: `system` (replaces the first system
@@ -144,4 +172,5 @@ With `storage.record_inputs: false` the gateway keeps no prompts, answers or vau
 hashes (so `wrapper delete --value` still finds the requests).
 
 ## Tests
-`.venv/bin/pytest -q` (82 tests, no network: the model is faked at `Wrapper.acompletion`).
+`.venv/bin/pytest -q` (89 tests, no network, about a minute: the model is faked at `Wrapper.acompletion`; the A/B tests
+start a few child Python processes).

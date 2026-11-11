@@ -57,7 +57,7 @@ CREATE INDEX IF NOT EXISTS import_path ON import_batches(path, fingerprint);
 """
 
 
-MIGRATIONS = {"requests": {"cached_tokens": "INTEGER"}}
+MIGRATIONS = {"requests": {"cached_tokens": "INTEGER", "run_tag": "TEXT"}}
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -67,6 +67,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for col, typ in cols.items():
             if col not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+    # indexes on migrated columns can only be created once the column exists
+    conn.execute("CREATE INDEX IF NOT EXISTS requests_run_tag ON requests(run_tag)")
 
 
 def connect(path: str) -> sqlite3.Connection:

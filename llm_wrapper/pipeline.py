@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -105,6 +106,7 @@ class Wrapper:
         self.store = store
         self.key = key
         self.acompletion = litellm.acompletion  # seam for tests / alternative clients
+        self.run_tag = os.environ.get("WRAPPER_RUN_TAG") or None  # set by `wrapper ab run`; stamped on every row
         pv = self.policy.privacy
         self.detector = Detector(pv.patterns, [(c.id, c.type, c.regex) for c in pv.custom_patterns],
                                  pv.allow_patterns, skip_code_blocks=not pv.redact_code_blocks)
@@ -327,7 +329,7 @@ class Wrapper:
             "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
             "cached_tokens": usage.get("cached_tokens"), "cost_usd": cost, "latency_ms": (time.time() - p.started) * 1000,
             "finish_reason": resp.choices[0].finish_reason if resp is not None else None, "error": error,
-            "content_hash": None,
+            "content_hash": None, "run_tag": self.run_tag,
         })
         for s in p.spans:
             st.put("spans", s)
@@ -363,6 +365,7 @@ class Wrapper:
             "id": uuid.uuid4().hex, "ts": time.time(), "source": "own_live", "model_requested": "wrapper/auto",
             "policy_hash": self.loaded.hash, "fast_path": 1, "error": f"{type(exc).__name__}: {exc}",
             "metadata_json": dumps(metadata), "session_key": session_key(messages, metadata),
+            "run_tag": self.run_tag,
         })
 
 

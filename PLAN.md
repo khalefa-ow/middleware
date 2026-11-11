@@ -36,7 +36,7 @@ The gateway also:
 ## 2. Status
 | Part | State |
 |---|---|
-| v1 prototype | Built in `llm_wrapper/`: provider (sync, async, streaming), routing rules, redaction and restore, size checks, SQLite tracing, CLI. The whole suite (82 offline tests) passes with `.venv/bin/pytest -q` |
+| v1 prototype | Built in `llm_wrapper/`: provider (sync, async, streaming), routing rules, redaction and restore, size checks, SQLite tracing, CLI. The whole suite (89 offline tests) passes with `.venv/bin/pytest -q` |
 | Live validation (M1) | **Done** (2026-11-10). A live DeepSeek call redacted an email and a phone, restored both, streaming worked. Fastlanes stage 2 through `wrapper/auto`: 10 calls, task passed, the wrapper's token totals equal cppagent's exactly, the provider's `response_format` rejection reached cppagent unchanged. (The direct control run failed stage 2; with n = 1 each this is chance, not a wrapper effect) |
 | Overhead (M2) | **Done.** `wrapper bench` on all 533 fastlanes prompts: p50 2.4 ms, p95 5.2 ms, p99 9.6 ms (after skipping exact token counts when a byte-length bound already fits; before: p95 38 ms) |
 | Trace import | cppagent importer, plus a generic OpenAI-chat importer (`import-chat`), which turns each assistant turn into one call with its exact cached-prefix tokens |
@@ -196,7 +196,7 @@ Each version ships only when its acceptance criteria (§8) pass on the replay se
   - ~~larger samples for decisions~~ (built: `--limit N`; reports say "exploratory" below 100 scored samples. The default stays 20 because a run costs money)
 - **M5b outcome scoring**, in two parts:
   - ~~a scorer plugin interface~~ (built: `python:module:fn(sample, answer) -> float | None`, scores stored per sample, mean, CI and paired difference per plugin, `primary:` picks the scorer the promotion bar uses)
-  - a run-level A/B harness (`wrapper ab`): run the caller's own command N times per arm, each arm with its own policy, and compare success rate and cost per successful run. This replaces the earlier idea of applying a single recorded patch, which can't work because traces don't hold the project state at the time of the call
+  - ~~a run-level A/B harness~~ (built as `wrapper ab run|report`, with `requests.run_tag`, Wilson and bootstrap intervals; the cppagent example in `examples/cppagent_ab/` is written but not run, it needs the owner's go-ahead for the spend). Original description: run the caller's own command N times per arm, each arm with its own policy, and compare success rate and cost per successful run. This replaces the earlier idea of applying a single recorded patch, which can't work because traces don't hold the project state at the time of the call
 - **M5c tuning arms:**
   - ~~prompt variants~~ (built: arm `system`, `system_file`, `system_suffix`; the judge sees the original request)
   - ~~context strategies~~ (built as a hook: arm `transform: python:module:fn`; `examples/transforms.py`. Summarizing strategies are the caller's to write)

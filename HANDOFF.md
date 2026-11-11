@@ -530,3 +530,10 @@ When section 5 is finished (or you stop early), give the user:
   system texts and loaded transforms; `examples/transforms.py` added. Note for later tasks: with an untrusted
   model the gateway appends its placeholder hint to the system message (or inserts one), so tests compare
   prefixes. 82 tests pass.
+- 2026-11-11: T12-T13 done. `llm_wrapper/ab.py` (`wrapper ab run|report`, tables `ab_experiments` / `ab_runs`,
+  `requests.run_tag` via `MIGRATIONS` plus an index created in `_migrate`), `tests/ab_child.py`, `tests/test_ab.py`;
+  `examples/cppagent_ab/{ab.yaml,run.sh,README.md,policies/}` written, NOT run. Deviations: `ab_runs` has an extra
+  `skipped` column; the second arm routes every call to gpt-6-luna (cppagent sends no `metadata.role` until M4, so a
+  per-role route could not match); success uses `^Success: True` on stdout (cppagent prints it once, for the last stage
+  it ran); commands run in their own process group so a timeout kills child processes too. The suite now takes about a
+  minute because the A/B tests start child Python processes. 89 tests pass.

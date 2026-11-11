@@ -1,0 +1,6 @@
+# Control arm: everything goes to deepseek-chat (the model the fastlanes traces were recorded with).
+version: 1
+models:
+  default: deepseek/deepseek-chat
+size:
+  continue_output: true

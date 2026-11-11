@@ -1,0 +1,4 @@
+# Overlay for the second arm: the same agent, every call answered by gpt-6-luna instead.
+# (A per-role route, e.g. planner only, needs cppagent to send metadata.role: plan item M4.)
+models:
+  default: openai/gpt-6-luna

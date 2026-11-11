@@ -1,4 +1,4 @@
-"""Command line: wrapper init | validate | import-cppagent | import-chat | analyze | bench | experiment |
+"""Command line: wrapper init | validate | import-cppagent | import-chat | analyze | bench | experiment | ab |
 export-finetune | delete | purge | health | show."""
 
 from __future__ import annotations
@@ -187,6 +187,22 @@ def cmd_experiment(args) -> int:
     return 0
 
 
+def cmd_ab(args) -> int:
+    from . import ab
+
+    st = _store(args)
+    try:
+        if args.action == "report":
+            rep = ab.ab_report(st, args.target)
+        else:
+            rep = ab.run_ab(st, args.target, log=lambda m: print(m, file=sys.stderr, flush=True))
+    except (ValueError, PolicyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(rep, indent=2) if args.json else ab.format_ab_report(rep))
+    return 0
+
+
 def cmd_export_finetune(args) -> int:
     from .experiments import Dataset
     from .finetune import export_finetune, holdout_spec
@@ -283,6 +299,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--limit", type=int, help="run: samples to use (overrides dataset.limit; 100+ for decisions)")
     s.add_argument("--dry", action="store_true", help="run: estimate only; no model calls, nothing stored")
     s.set_defaults(fn=cmd_experiment)
+
+    s = sub.add_parser("ab", help="run-level A/B: run a command N times per arm, each arm under its own policy")
+    s.add_argument("action", choices=["run", "report"])
+    s.add_argument("target", help="spec YAML (run) or experiment id (report)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ab)
 
     s = sub.add_parser("export-finetune", help="export recorded calls as a fine-tuning dataset (train + holdout)")
     s.add_argument("name", help="export name (also the split name experiments use via dataset.holdout_of)")

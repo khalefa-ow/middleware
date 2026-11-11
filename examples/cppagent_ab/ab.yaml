@@ -1,0 +1,18 @@
+# Run-level A/B on the fastlanes task: does routing every call to gpt-6-luna change the success rate and
+# the cost per successful run?   NOT RUN YET: it calls real models (about $0.02-0.10 per run).
+#
+#   .venv/bin/wrapper --db var/ab.db ab run examples/cppagent_ab/ab.yaml
+#   .venv/bin/wrapper --db var/ab.db ab report fastlanes-ab
+id: fastlanes-ab
+command: ["bash", "run.sh", "{run_dir}", "{policy}"]
+cwd: .                              # relative to this file
+# env:
+#   SEED_DIR: /path/to/snapshot-after-stage-1   # same starting state for every run (see README)
+arms:                               # the first arm is the control
+  - {id: deepseek, policy: policies/base.yaml}
+  - {id: luna, policy: policies/base.yaml, overlays: [policies/luna_default.yaml]}
+runs: 5                             # per arm
+success: {stdout_regex: "^Success: True"}   # cppagent prints "Success: True|False" for the last stage it ran
+timeout_s: 1800
+budget_usd: 1.5
+out_dir: ../../var/ab               # runs, logs and policies land here (git-ignored)
