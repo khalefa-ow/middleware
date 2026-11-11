@@ -36,16 +36,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import difflib
 import json
 import random
 import re
 import time
 import uuid
-from typing import Any, Literal
+from pathlib import Path
+from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .pipeline import Wrapper
 from .storage import Store, dumps
@@ -81,33 +83,118 @@ class Judge(_Strict):
     max_chars: int = 12000
 
 
+BUILTIN_SCORERS = ("json_valid", "similarity", "judge")
+_PLUGIN = re.compile(r"^python:([A-Za-z_][\w.]*):([A-Za-z_]\w*)$")
+
+
+def scorer_name(ref: str) -> str:
+    """Built-ins keep their name; a plugin ``python:module:function`` is named after its function."""
+    m = _PLUGIN.match(ref)
+    return m.group(2) if m else ref
+
+
 class Spec(_Strict):
     id: str
     dataset: Dataset = Dataset()
     arms: list[Arm] = Field(min_length=1)
-    scorers: list[Literal["json_valid", "similarity", "judge"]] = ["json_valid", "similarity"]
+    scorers: list[str] = ["json_valid", "similarity"]
+    """Built-ins (json_valid, similarity, judge) and/or plugins written ``python:<module>:<function>``."""
+    primary: str = "judge"
+    """The scorer the promotion bar uses: ``judge`` or a plugin's function name."""
     judge: Judge | None = None
     budget_usd: float = 1.0
     concurrency: int = Field(4, ge=1, le=32)
 
+    @model_validator(mode="after")
+    def _check_scorers(self) -> "Spec":
+        names = []
+        for ref in self.scorers:
+            if ref in BUILTIN_SCORERS:
+                names.append(ref)
+            elif m := _PLUGIN.match(ref):
+                if m.group(2) in BUILTIN_SCORERS:
+                    raise ValueError(f"plugin {ref!r} uses the built-in scorer name {m.group(2)!r}")
+                names.append(m.group(2))
+            else:
+                raise ValueError(f"unknown scorer {ref!r}: use {', '.join(BUILTIN_SCORERS)} or python:<module>:<function>")
+        dup = sorted({n for n in names if names.count(n) > 1})
+        if dup:
+            raise ValueError(f"scorer names must be unique, repeated: {', '.join(dup)}")
+        if self.primary not in names and not (self.primary == "judge" and "judge" not in names):
+            raise ValueError(f"primary scorer {self.primary!r} is not in scorers {names}")
+        return self
+
+    @property
+    def plugin_refs(self) -> list[str]:
+        return [r for r in self.scorers if r not in BUILTIN_SCORERS]
+
 
 BUDGET_ERROR = "budget exhausted"
+MIN_DECISION_SAMPLES = 100
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS experiments (id TEXT PRIMARY KEY, spec_yaml TEXT, started REAL, finished REAL, status TEXT);
 CREATE TABLE IF NOT EXISTS experiment_results (
   experiment_id TEXT, arm_id TEXT, sample_id TEXT, model TEXT, ok INTEGER, error TEXT,
   prompt_tokens INTEGER, completion_tokens INTEGER, cached_tokens INTEGER, cost_usd REAL, latency_ms REAL,
-  answer TEXT, json_valid REAL, similarity REAL, judge REAL, judge_cost_usd REAL, judge_error TEXT, ts REAL
+  answer TEXT, json_valid REAL, similarity REAL, judge REAL, judge_cost_usd REAL, judge_error TEXT, ts REAL,
+  scores_json TEXT
 );
 CREATE INDEX IF NOT EXISTS exp_res ON experiment_results(experiment_id, arm_id);
 CREATE TABLE IF NOT EXISTS dataset_splits (name TEXT, request_id TEXT, split TEXT, PRIMARY KEY (name, request_id));
 """
 
 
-def load_spec(path: str) -> tuple[Spec, str]:
+RESULT_COLUMNS = {"judge_error": "TEXT", "scores_json": "TEXT"}
+"""Columns added after the first release; ``ensure_schema`` adds them to older databases."""
+
+
+def ensure_schema(store: Store) -> None:
+    with store_conn(store) as c:
+        c.executescript(SCHEMA)
+        have = {r[1] for r in c.execute("PRAGMA table_info(experiment_results)")}
+        for col, typ in RESULT_COLUMNS.items():
+            if col not in have:
+                c.execute(f"ALTER TABLE experiment_results ADD COLUMN {col} {typ}")
+
+
+def load_plugins(spec: Spec, spec_dir: str) -> dict[str, Any]:
+    """Import ``python:module:function`` scorers. The spec's folder goes first on sys.path.
+    Specs run code: only load specs you trust."""
+    import importlib
+    import sys
+
+    out: dict[str, Any] = {}
+    if not spec.plugin_refs:
+        return out
+    d = str(Path(spec_dir).resolve())
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    importlib.invalidate_caches()
+    for ref in spec.plugin_refs:
+        _, mod, fn = ref.split(":")
+        loaded = sys.modules.get(mod)
+        if loaded is not None and not str(getattr(loaded, "__file__", "") or "").startswith(d):
+            del sys.modules[mod]  # same module name from another folder: load this spec's own
+        try:
+            f = getattr(importlib.import_module(mod), fn)
+        except (ImportError, AttributeError) as exc:
+            raise ValueError(f"cannot load scorer {ref!r}: {exc}") from exc
+        if not callable(f):
+            raise ValueError(f"scorer {ref!r} is not callable")
+        out[fn] = f
+    return out
+
+
+def load_spec(path: str, limit: int | None = None) -> tuple[Spec, str]:
+    """``limit`` overrides ``dataset.limit`` (the --limit flag)."""
     text = open(path).read()
-    return Spec.model_validate(yaml.safe_load(text)), text
+    spec = Spec.model_validate(yaml.safe_load(text))
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("--limit must be at least 1")
+        spec.dataset.limit = limit
+    return spec, text
 
 
 def sample(store: Store, ds: Dataset) -> list[dict[str, Any]]:
@@ -208,15 +295,13 @@ def _request_text(messages: list[dict], max_chars: int) -> str:
 
 
 class Runner:
-    def __init__(self, wrapper: Wrapper, store: Store, spec: Spec, spec_yaml: str):
+    def __init__(self, wrapper: Wrapper, store: Store, spec: Spec, spec_yaml: str, spec_dir: str = "."):
         self.w, self.store, self.spec, self.spec_yaml = wrapper, store, spec, spec_yaml
         self.spent = 0.0
         self.judge_spent = 0.0
         self.rng = random.Random(spec.dataset.seed)
-        with store_conn(store) as c:
-            c.executescript(SCHEMA)
-            if "judge_error" not in {r[1] for r in c.execute("PRAGMA table_info(experiment_results)")}:
-                c.execute("ALTER TABLE experiment_results ADD COLUMN judge_error TEXT")
+        self.plugins = load_plugins(spec, spec_dir)
+        ensure_schema(store)
 
     async def _call(self, model: str, messages: list[dict], params: dict, tag: dict) -> tuple[Any, float]:
         t = time.perf_counter()
@@ -276,10 +361,34 @@ class Runner:
                 row["json_valid"] = score_json_valid(reference, answer)
             if "similarity" in self.spec.scorers:
                 row["similarity"] = score_similarity(reference, answer)
+            if self.plugins:
+                row["scores_json"] = dumps(self._plugin_scores(s, reference, answer))
             if "judge" in self.spec.scorers:
                 row["judge"], row["judge_cost_usd"], row["judge_error"] = await self._judge(
                     messages, reference, answer, tag)
             self.store.put("experiment_results", row)
+
+    def _plugin_scores(self, s: dict, reference: str, answer: str) -> dict[str, Any]:
+        """name -> score in 0..1 or null; failures never abort the run, they go under ``_errors``."""
+        sample_view = {"id": s["id"], "messages": json.loads(s["input_json"]), "reference": reference,
+                       "meta": s["meta"], "params": json.loads(s.get("params_json") or "{}")}
+        scores: dict[str, Any] = {}
+        errors: dict[str, str] = {}
+        for name, fn in self.plugins.items():
+            try:
+                v = fn(copy.deepcopy(sample_view), answer)
+                if v is None:
+                    scores[name] = None
+                elif isinstance(v, bool) or not isinstance(v, (int, float)) or not (0.0 <= float(v) <= 1.0):
+                    raise ValueError(f"returned {v!r}; expected a number in 0..1 or None")
+                else:
+                    scores[name] = float(v)
+            except Exception as exc:  # a plugin is foreign code: contain it
+                scores[name] = None
+                errors[name] = f"{type(exc).__name__}: {exc}"[:200]
+        if errors:
+            scores["_errors"] = errors
+        return scores
 
     async def run(self) -> list[dict]:
         samples = sample(self.store, self.spec.dataset)
@@ -371,6 +480,16 @@ def _paired(arm_rows: list[dict], ctl_rows: list[dict], key: str) -> dict[str, A
     return {"n": len(d), "mean": sum(d) / len(d), "ci95": bootstrap_ci(d)}
 
 
+def _plugin_summary(ok_rows: list[dict], name: str) -> dict[str, Any]:
+    xs = [r[f"score:{name}"] for r in ok_rows if r[f"score:{name}"] is not None]
+    errs: list[str] = []
+    for r in ok_rows:
+        for msg in (r["_plugin_errors"].get(name),):
+            if msg and msg not in errs:
+                errs.append(msg)
+    return {"n": len(xs), "mean": _mean(xs), "ci95": bootstrap_ci(xs), "errors": errs[:3]}
+
+
 def report(store: Store, experiment_id: str, samples: list[dict] | None = None) -> dict[str, Any]:
     rows = [dict(r) for r in store.query("SELECT * FROM experiment_results WHERE experiment_id=?", (experiment_id,))]
     arms: dict[str, list[dict]] = {}
@@ -380,6 +499,15 @@ def report(store: Store, experiment_id: str, samples: list[dict] | None = None) 
     spec_row = store.query("SELECT spec_yaml FROM experiments WHERE id=?", (experiment_id,))
     order = [a["id"] for a in (yaml.safe_load(spec_row[0]["spec_yaml"]).get("arms", []) if spec_row else [])]
     out["control"] = order[0] if order else None
+    spec_d = yaml.safe_load(spec_row[0]["spec_yaml"]) if spec_row else {}
+    plugin_names = [scorer_name(r) for r in (spec_d.get("scorers") or []) if r not in BUILTIN_SCORERS]
+    out["primary"] = spec_d.get("primary", "judge")
+    out["plugins"] = plugin_names
+    for r in rows:  # flatten plugin scores so they can be treated like columns
+        sc = json.loads(r.get("scores_json") or "{}")
+        for n in plugin_names:
+            r[f"score:{n}"] = sc.get(n)
+        r["_plugin_errors"] = sc.get("_errors") or {}
     if samples is None:
         ids = sorted({r["sample_id"] for r in rows})
         samples = [dict(r) for i in ids for r in store.query(
@@ -415,6 +543,7 @@ def report(store: Store, experiment_id: str, samples: list[dict] | None = None) 
                                    sum(j == 0.0 for j in judged)],
             "judge_cost_usd": sum(r["judge_cost_usd"] or 0 for r in ok),
             "judge_errors": sorted({r["judge_error"] for r in ok if r.get("judge_error")})[:3],
+            "plugins": {n: _plugin_summary(ok, n) for n in plugin_names},
         }
     ctl_rows = arms.get(out["control"] or "", [])
     for arm, rs in arms.items():
@@ -422,6 +551,8 @@ def report(store: Store, experiment_id: str, samples: list[dict] | None = None) 
             continue
         out["arms"][arm]["vs_control"] = {k: _paired(rs, ctl_rows, k)
                                           for k in ("judge", "json_valid", "cost_usd", "latency_ms")}
+        for n in plugin_names:
+            out["arms"][arm]["vs_control"][n] = _paired(rs, ctl_rows, f"score:{n}")
     return out
 
 
@@ -444,8 +575,13 @@ def format_report(rep: dict[str, Any]) -> str:
         if a.get("judge_ci95"):
             lo, hi = a["judge_ci95"]
             lines.append(f"    judge 95% CI [{lo:.2f}, {hi:.2f}]")
+        for n, pl in (a.get("plugins") or {}).items():
+            ci_s = f" 95% CI [{pl['ci95'][0]:.2f}, {pl['ci95'][1]:.2f}]" if pl["ci95"] else ""
+            lines.append(f"    {n}: {f(pl['mean'], 2)}{ci_s} over {pl['n']}")
+            for e in pl["errors"]:
+                lines.append(f"    {n} error: {e}")
         for k, v in (a.get("vs_control") or {}).items():
-            if v and k in ("judge", "json_valid"):
+            if v and (k in ("judge", "json_valid") or k in (rep.get("plugins") or [])):
                 ci = v["ci95"]
                 sig = "" if not ci else (" (significant)" if ci[0] > 0 or ci[1] < 0 else " (not significant)")
                 ci_s = f" CI [{ci[0]:+.2f}, {ci[1]:+.2f}]" if ci else ""
@@ -454,9 +590,21 @@ def format_report(rep: dict[str, Any]) -> str:
             lines.append(f"    {a['skipped_budget']} sample(s) skipped: experiment budget exhausted (n above counts them)")
         for e in a.get("judge_errors", []):
             lines.append(f"    judge error: {e}")
-    lines += ["", "judge: candidate vs. the logged answer, blind and order-randomized; 1 = better, 0.5 = tie, 0 = worse.",
-              "Promotion bar: judge >= 0.45 with 95% CI low >= 0.35 over >= 20 judged samples, paired judge vs",
-              "control not significantly worse, json ok >= 0.95, cheaper than control."]
+    primary = rep.get("primary", "judge")
+    lines += ["", "judge: candidate vs. the logged answer, blind and order-randomized; 1 = better, 0.5 = tie, 0 = worse."]
+    if primary == "judge":
+        lines += ["Promotion bar: judge >= 0.45 with 95% CI low >= 0.35 over >= 20 judged samples, paired judge vs",
+                  "control not significantly worse, json ok >= 0.95, cheaper than control."]
+    else:
+        lines += [f"Promotion bar (primary scorer {primary}): >= 20 scored samples, paired {primary} vs control not",
+                  "significantly worse, json ok >= 0.95, cheaper than control."]
+
+    def scored(a: dict[str, Any]) -> int:
+        return a["judged"] if primary == "judge" else (a.get("plugins") or {}).get(primary, {}).get("n", 0)
+
+    if any(scored(a) < MIN_DECISION_SAMPLES for a in rep["arms"].values()):
+        lines.append(f"exploratory: fewer than {MIN_DECISION_SAMPLES} scored samples; "
+                     "only large differences are detectable")
     return "\n".join(lines)
 
 
@@ -468,17 +616,26 @@ def promotion_snippet(rep: dict[str, Any], role: str | None, min_judged: int = 2
     lg = rep["logged"]
     ctl = rep["arms"].get(rep.get("control") or "", {})
     best = None
+    primary = rep.get("primary", "judge")
     for arm, a in rep["arms"].items():
         if arm == rep.get("control"):
             continue
-        if a["errors"] or a["judged"] < min_judged or (a["judge_score"] or 0) < min_score:
+        if a["errors"]:
             continue
-        ci = a.get("judge_ci95")
-        if ci and ci[0] < min_score - margin:
-            continue  # too uncertain: could be clearly worse than the logged answers
-        pj = (a.get("vs_control") or {}).get("judge")
-        if pj and pj["ci95"] and pj["ci95"][1] < 0:
-            continue  # significantly worse than the control arm
+        if primary == "judge":
+            if a["judged"] < min_judged or (a["judge_score"] or 0) < min_score:
+                continue
+            ci = a.get("judge_ci95")
+            if ci and ci[0] < min_score - margin:
+                continue  # too uncertain: could be clearly worse than the logged answers
+            pj = (a.get("vs_control") or {}).get("judge")
+            if pj and pj["ci95"] and pj["ci95"][1] < 0:
+                continue  # significantly worse than the control arm
+        else:  # a plugin scorer decides: enough scored samples and not significantly worse than the control
+            pl = (a.get("plugins") or {}).get(primary)
+            pp = (a.get("vs_control") or {}).get(primary)
+            if not pl or pl["n"] < min_judged or not pp or not pp["ci95"] or pp["ci95"][1] < 0:
+                continue
         if ctl.get("mean_cost_usd") and (a["mean_cost_usd"] or 1e9) >= ctl["mean_cost_usd"]:
             continue
         if (a["json_valid"] is not None and a["json_valid"] < 0.95):
@@ -496,14 +653,20 @@ def promotion_snippet(rep: dict[str, Any], role: str | None, min_judged: int = 2
     compile_expr(when)  # fail here, not when the policy is loaded
     base = ctl.get("mean_cost_usd") or lg["mean_cost_usd"]
     saving = f"{(1 - a['mean_cost_usd'] / base):.0%}" if base else "?"
-    return (f"# proposal from experiment {rep['experiment']}: arm {arm}, judge {a['judge_score']:.2f} over "
-            f"{a['judged']} samples, cost {saving} lower than the control arm\n"
+    if primary == "judge":
+        evidence = f"judge {a['judge_score']:.2f} over {a['judged']} samples"
+    else:
+        pl = a["plugins"][primary]
+        evidence = f"{primary} {pl['mean']:.2f} over {pl['n']} samples"
+    return (f"# proposal from experiment {rep['experiment']}: arm {arm}, {evidence}, "
+            f"cost {saving} lower than the control arm\n"
             f"routes:\n  - id: {rep['experiment']}-{arm}\n    when: \"{when}\"\n    model: {a['model']}\n")
 
 
-async def run_experiment(wrapper: Wrapper, store: Store, spec_path: str) -> dict[str, Any]:
-    spec, text = load_spec(spec_path)
-    runner = Runner(wrapper, store, spec, text)
+async def run_experiment(wrapper: Wrapper, store: Store, spec_path: str, limit: int | None = None
+                         ) -> dict[str, Any]:
+    spec, text = load_spec(spec_path, limit)
+    runner = Runner(wrapper, store, spec, text, str(Path(spec_path).resolve().parent))
     samples = await runner.run()
     rep = report(store, spec.id, samples)
     rep["promotion"] = promotion_snippet(rep, spec.dataset.role)
@@ -511,7 +674,7 @@ async def run_experiment(wrapper: Wrapper, store: Store, spec_path: str) -> dict
     return rep
 
 
-def dry_run(wrapper: Wrapper, store: Store, spec_path: str) -> dict[str, Any]:
+def dry_run(wrapper: Wrapper, store: Store, spec_path: str, limit: int | None = None) -> dict[str, Any]:
     """What a run would do, without calling any model or writing anything: per arm, how many samples
     the gateway would refuse or reroute, placeholders, and token and cost estimates. Estimates use list
     prices with no cache discount and the logged answer's length as the output length."""
@@ -520,7 +683,7 @@ def dry_run(wrapper: Wrapper, store: Store, spec_path: str) -> dict[str, Any]:
     from . import size as size_mod
     from .privacy import EgressBlocked, NonTextBlocked
 
-    spec, _ = load_spec(spec_path)
+    spec, _ = load_spec(spec_path, limit)
     samples = sample(store, spec.dataset)
     if not samples:
         raise ValueError("no recorded calls match the dataset filter")

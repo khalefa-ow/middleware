@@ -176,3 +176,85 @@ def test_dry_run_calls_nothing_writes_nothing_and_reports_estimates(make_wrapper
     tables = {r["name"] for r in store.query("SELECT name FROM sqlite_master WHERE type='table'")}
     for t in ("experiment_results", "experiments"):  # not even created by a dry run
         assert t not in tables or store.query(f"SELECT count(*) AS n FROM {t}")[0]["n"] == 0
+
+
+SCORER_MODULE = '''
+def has_steps(sample, answer):
+    assert sample["messages"] and "reference" in sample and "meta" in sample and "params" in sample
+    return 1.0 if '"steps"' in answer else 0.0
+
+def boom(sample, answer):
+    raise RuntimeError("scorer exploded")
+
+def out_of_range(sample, answer):
+    return 3
+'''
+
+
+async def test_scorer_plugins_scores_ci_paired_and_primary_promotion(make_wrapper, store, tmp_path):
+    _seed(store, 25)
+    (tmp_path / "plug_scorers_t9.py").write_text(SCORER_MODULE)
+    w = make_wrapper(Scripted())
+    spec = {"id": "plug", "dataset": {"role": "planner", "limit": 25}, "primary": "has_steps",
+            "scorers": ["json_valid", "python:plug_scorers_t9:has_steps", "python:plug_scorers_t9:boom",
+                        "python:plug_scorers_t9:out_of_range"],
+            "arms": [{"id": "ctl", "model": "openai/gpt-4o"}, {"id": "mini", "model": "openai/gpt-4o-mini"}]}
+    p = tmp_path / "spec.yaml"
+    p.write_text(yaml.safe_dump(spec))
+    rep = await ex.run_experiment(w, store, str(p))
+    mini, ctl = rep["arms"]["mini"], rep["arms"]["ctl"]
+    assert mini["plugins"]["has_steps"]["mean"] == 1.0 and ctl["plugins"]["has_steps"]["mean"] == 0.0
+    assert mini["plugins"]["has_steps"]["ci95"] is not None and mini["plugins"]["has_steps"]["n"] == 25
+    pv = mini["vs_control"]["has_steps"]
+    assert pv["mean"] == 1.0 and pv["n"] == 25 and pv["ci95"][0] > 0
+    # a raising scorer and an out-of-range one yield no score, never abort, and the errors are reported
+    assert mini["plugins"]["boom"]["n"] == 0 and "scorer exploded" in mini["plugins"]["boom"]["errors"][0]
+    assert "expected a number in 0..1" in mini["plugins"]["out_of_range"]["errors"][0]
+    assert "has_steps" in ex.format_report(rep) and "boom error" in ex.format_report(rep)
+    stored = json.loads(store.query("SELECT scores_json FROM experiment_results WHERE arm_id='mini'")[0]["scores_json"])
+    assert stored["has_steps"] == 1.0 and stored["boom"] is None and "boom" in stored["_errors"]
+    # promotion is decided by the plugin primary scorer (no judge configured at all)
+    assert "routes:" in rep["promotion"] and "has_steps 1.00 over 25" in rep["promotion"]
+    # the report also works from the stored rows alone
+    assert ex.report(store, "plug")["arms"]["mini"]["plugins"]["has_steps"]["mean"] == 1.0
+
+
+def test_scorer_spec_validation():
+    import pytest
+    base = {"id": "x", "arms": [{"id": "a", "model": "m"}]}
+    with pytest.raises(ValueError, match="unique"):
+        ex.Spec.model_validate(base | {"scorers": ["python:a:f", "python:b:f"]})
+    with pytest.raises(ValueError, match="built-in"):
+        ex.Spec.model_validate(base | {"scorers": ["python:a:judge"]})
+    with pytest.raises(ValueError, match="unknown scorer"):
+        ex.Spec.model_validate(base | {"scorers": ["nonsense"]})
+    with pytest.raises(ValueError, match="primary"):
+        ex.Spec.model_validate(base | {"scorers": ["similarity"], "primary": "other"})
+    ex.Spec.model_validate(base | {"scorers": ["similarity"]})  # default primary judge, no judge: allowed
+
+
+async def test_scorer_plugin_load_failure_is_a_clear_error(make_wrapper, store, tmp_path):
+    import pytest
+    _seed(store, 2)
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"id": "bad", "arms": [{"id": "a", "model": "m"}],
+                                 "scorers": ["python:no_such_module_t9:f"]}))
+    with pytest.raises(ValueError, match="cannot load scorer"):
+        await ex.run_experiment(make_wrapper(FakeModel()), store, str(p))
+
+
+async def test_limit_override_and_exploratory_label(make_wrapper, store, tmp_path):
+    _seed(store, 6)
+    fake = Scripted()
+    w = make_wrapper(fake)
+    p = tmp_path / "l.yaml"
+    p.write_text(yaml.safe_dump({"id": "lim", "dataset": {"role": "planner", "limit": 5},
+                                 "arms": [{"id": "mini", "model": "openai/gpt-4o-mini"}],
+                                 "scorers": ["judge"], "judge": {"model": "j", "max_usd": 1}}))
+    rep = await ex.run_experiment(w, store, str(p), limit=2)
+    assert rep["arms"]["mini"]["n"] == 2
+    assert "exploratory: fewer than 100 scored samples" in ex.format_report(rep)
+    assert ex.dry_run(w, store, str(p), limit=3)["samples"] == 3
+    import pytest
+    with pytest.raises(ValueError, match="at least 1"):
+        ex.load_spec(str(p), limit=0)

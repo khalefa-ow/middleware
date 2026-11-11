@@ -519,3 +519,9 @@ When section 5 is finished (or you stop early), give the user:
   `contextlib.closing`); export skips non-text examples; budget skips are recorded (`skipped_budget`)
   and unsafe roles get no route. 70 tests pass. Local git repo created (commit 890d28d); no remote (no `gh`
   or token on this machine).
+- 2026-11-11: T6-T10 done. `response_format` recorded in `params_json` (original schema when `record_inputs` is
+  true) and replayed; arm param `null` removes a param; schemas are redacted and leak-checked like tool
+  schemas (`redact_response_format`, `Prepared.caller_response_format`); `experiment run --dry`; scorer
+  plugins (`scores_json` column, `Spec.primary`, `RESULT_COLUMNS` + `ensure_schema`); `--limit` and the
+  "exploratory" label. Deviation: `Spec.scorers` stays a list of strings and a default `primary: judge` is
+  allowed without a judge scorer (promotion then finds nothing). 79 tests pass.

@@ -76,18 +76,47 @@ scorers: [json_valid, similarity, judge]
 judge: {model: openai/gpt-5.3-codex, max_usd: 0.6}                # blind, order-randomized
 budget_usd: 0.5
 concurrency: 6
+# primary: judge                       # the scorer the promotion bar uses (judge or a plugin's function name)
 ```
 ```bash
 .venv/bin/wrapper --db fl.db experiment run planner.yaml     # report + promotion proposal (a policy route)
 .venv/bin/wrapper --db fl.db experiment report planner-cheaper
+.venv/bin/wrapper --db fl.db experiment run planner.yaml --dry     # no model calls: refusals, reroutes, cost estimate
+.venv/bin/wrapper --db fl.db experiment run planner.yaml --limit 100   # 100+ scored samples for decisions
 ```
 Every arm call goes through the gateway (redaction, size checks, tracing; source `experiment`).
-Replays reuse the caller's recorded params when the gateway recorded them.
+Replays reuse the caller's recorded params when the gateway recorded them, including a
+`response_format` schema (an arm param set to `null` removes that param, e.g. `params: {response_format: null}`).
+Reports below 100 scored samples say "exploratory": only large differences are detectable.
+`--dry` runs the gateway's checks on every sample and arm (nothing is sent or stored) and prints
+what would be refused or rerouted and an estimated cost (list price, no cache discount).
 
 `budget_usd` caps the arm calls only; the judge has its own cap (`judge.max_usd`). Calls already in
 flight when a cap is reached still finish, so spend can overshoot by up to `concurrency` calls.
 Samples skipped because the budget ran out get a result row (`error: budget exhausted`) and are
 reported as `skipped_budget`, not as errors.
+
+### Your own scorers
+
+A scorer plugin is a function `fn(sample, answer) -> float | None` (0..1; `None` = not applicable).
+`sample` has `id`, `messages`, `reference` (the logged answer), `meta` and `params`.
+
+```python
+# checks.py (next to the spec)
+import json
+def valid_plan(sample, answer):
+    try:
+        return 1.0 if json.loads(answer).get("steps") else 0.0
+    except Exception:
+        return 0.0
+```
+```yaml
+scorers: [json_valid, "python:checks:valid_plan"]
+primary: valid_plan        # promotion uses this scorer instead of the judge
+```
+Each plugin gets a mean, a bootstrap 95% CI and a paired difference against the control. A plugin that
+raises or returns something outside 0..1 scores `None` for that sample; the first errors appear in the report.
+**A spec runs Python code from its folder: only run specs you trust.**
 
 ### Fine-tuning datasets
 
@@ -106,4 +135,4 @@ With `storage.record_inputs: false` the gateway keeps no prompts, answers or vau
 hashes (so `wrapper delete --value` still finds the requests).
 
 ## Tests
-`.venv/bin/pytest -q` (70 tests, no network: the model is faked at `Wrapper.acompletion`).
+`.venv/bin/pytest -q` (79 tests, no network: the model is faked at `Wrapper.acompletion`).
