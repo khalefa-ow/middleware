@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+# recorded traces and experiment databases can hold private prompts; never commit them
+var/
+*.db
+*.db-wal
+*.db-shm
+# secrets
+.env
+*.key

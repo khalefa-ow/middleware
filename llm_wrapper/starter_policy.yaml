@@ -1,0 +1,66 @@
+# llm_wrapper policy (v1: safe pass-through with routing).
+# Validate with:  wrapper validate <this file>
+# Secrets are referenced, never written here: ${ENV:NAME} or ${FILE:path}.
+version: 1
+
+models:
+  # Real model used when no route matches. Never "wrapper/..." (validate rejects self-calls).
+  default: deepseek/deepseek-chat
+  # Larger-context models a too-big request may be rerouted to (no content is dropped).
+  large_context: []
+
+privacy:
+  enabled: true
+  # Models that may receive real values (e.g. a local model). Everything else gets placeholders.
+  trusted: []
+  # conversation: same value -> same placeholder within one conversation only (not linkable across them).
+  # global: same placeholder everywhere (lets the provider link requests).
+  key_scope: conversation
+  # input_only: the response may only contain private values the caller sent in.
+  response_values: input_only
+  # Images/audio/files cannot be redacted: pass | block | trusted_only
+  non_text: trusted_only
+  # Built-in detectors: email, phone, card (Luhn-checked), ssn, api_key, ipv4
+  patterns: [email, phone, card, ssn, api_key]
+  custom_patterns: []
+  #  - id: employee_id
+  #    type: EMPLOYEE_ID
+  #    regex: 'EMP-\d{6}'
+  # Never redacted (e.g. order ids that look like phone numbers).
+  allow_patterns: []
+  # Text inside ``` fences is left alone unless this is true (avoids breaking code).
+  redact_code_blocks: false
+  # Tell the model to keep placeholders as written (added only when placeholders exist).
+  placeholder_hint: true
+  # Block the call if a known real value is still in the outbound payload after redaction.
+  leak_check: true
+
+# First matching route wins. Conditions: field paths, == != < <= > >= in, and/or/not,
+# `field matches 'regex'`. Fields: metadata.* (from the caller's litellm metadata) and
+# request.system, request.last_user, request.n_messages, request.chars,
+# request.has_tools, request.has_response_format, request.stream.
+# A caller can also pick a route explicitly with metadata.wrapper_route: <id>.
+routes: []
+#  - id: planner_cheap
+#    when: metadata.role == 'planner' or request.system matches '^Decide whether this task'
+#    model: deepseek/deepseek-chat
+
+size:
+  margin: 0.10                  # safety margin on top of the token count
+  reserve_output_tokens: 4096   # reserved for the answer when the caller sets no max_tokens
+  continue_output: true         # continue plain text cut off at the limit (never tool calls / JSON)
+  max_continuations: 2
+  reroute: true                 # move a too-big request to models.large_context
+  limits: {}                    # per-model max input tokens overriding LiteLLM's model info
+
+limits:
+  call_timeout_s: 600
+  max_depth: 1                  # self-call guard
+
+retention:
+  requests_days: 90
+  vault_days: 90
+
+storage:
+  path: ~/.llm_wrapper/wrapper.db
+  record_inputs: true           # store real inputs/outputs locally (encrypted disk recommended)

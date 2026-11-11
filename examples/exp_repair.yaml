@@ -1,0 +1,9 @@
+id: fastlanes-repair
+dataset: {source: own_import, role: repair, model: deepseek/deepseek-chat, limit: 20, seed: 1}
+arms:
+  - {id: deepseek-rerun, model: deepseek/deepseek-chat}
+  - {id: luna, model: openai/gpt-6-luna}
+scorers: [json_valid, similarity, judge]
+judge: {model: openai/gpt-5.3-codex, max_usd: 0.6, max_chars: 12000}
+budget_usd: 0.5
+concurrency: 6
