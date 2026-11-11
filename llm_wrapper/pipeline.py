@@ -60,6 +60,8 @@ class Prepared:
     source: str = "own_live"
     caller_response_format: Any = None
     """The caller's response_format as given; ``params`` holds the redacted copy that is sent."""
+    fallback_from: str | None = None
+    fallback_error: str | None = None
     spans: list[dict] = field(default_factory=list)
 
 
@@ -195,7 +197,25 @@ class Wrapper:
             self._span(p, "prepare", t0, route=p.route_id, model=p.model, placeholders=len(p.vault),
                        size=p.size.strategy, tokens=p.size.tokens)
             t1 = time.time()
-            resp = await self._call(p, p.messages)
+            try:
+                resp = await self._call(p, p.messages)
+            except Exception as exc:
+                target = self._fallback_target(exc, p, force_model)
+                if target is None:
+                    raise  # fallback off, not applicable, or not a configuration error: the caller sees the error
+                t_fb = time.time()
+                try:
+                    p2 = self.prepare(messages, params, metadata, force_model=target, source=source)
+                except Exception:
+                    raise exc  # cannot prepare for the fallback (e.g. too large): the original error is the useful one
+                p2.route_id, p2.fallback_from, p2.fallback_error = "fallback", p.model, type(exc).__name__
+                self._span(p2, "prepare", t_fb, route=p2.route_id, model=p2.model, placeholders=len(p2.vault),
+                           size=p2.size.strategy, tokens=p2.size.tokens)
+                self._span(p2, "fallback", t_fb, from_model=p.model, to=p2.model, error=type(exc).__name__,
+                           message=str(exc)[:300])
+                p = p2
+                t1 = time.time()
+                resp = await self._call(p, p.messages)
             self._span(p, "model_call", t1, model=p.model)
             usage = _usage_of(resp)
             # continue cut-off plain text
@@ -225,6 +245,23 @@ class Wrapper:
             elif self.store:
                 self._record_failed_prepare(messages, params, metadata, exc)
             raise
+
+    def _fallback_target(self, exc: Exception, p: Prepared, force_model: str | None) -> str | None:
+        """The model to retry on, or None. Only configuration errors on a routed (not forced) call qualify:
+        never timeouts, rate limits, context-window or content-policy errors (those are not about the model
+        choice), and never when the failing model already is the fallback target."""
+        fb = self.policy.fallback
+        if not fb.enabled or force_model is not None:
+            return None
+        if isinstance(exc, (litellm.ContextWindowExceededError, litellm.ContentPolicyViolationError)):
+            return None
+        kind = ("bad_request" if isinstance(exc, litellm.BadRequestError)
+                else "not_found" if isinstance(exc, litellm.NotFoundError)
+                else "auth" if isinstance(exc, litellm.AuthenticationError) else None)
+        target = fb.to or self.policy.models.default
+        if kind is None or kind not in fb.on or target == p.model:
+            return None
+        return target
 
     def restore_response(self, resp: Any, p: Prepared) -> RestoreReport:
         rr = RestoreReport()
@@ -297,7 +334,8 @@ class Wrapper:
         try:
             pin, pout = litellm.cost_per_token(model=model, prompt_tokens=usage.get("prompt_tokens", 0),
                                                completion_tokens=usage.get("completion_tokens", 0),
-                                               cache_read_input_tokens=usage.get("cached_tokens", 0))
+                                               cache_read_input_tokens=usage.get("cached_tokens", 0),
+                                               cache_creation_input_tokens=usage.get("cache_write_tokens", 0))
             return pin + pout
         except Exception:
             return None
@@ -309,6 +347,8 @@ class Wrapper:
                 "placeholders": len(p.vault), "restored": rr.restored, "masked": rr.masked,
                 "unknown_placeholders": len(rr.unknown), "size_strategy": p.size.strategy,
                 "continuations": continuations, "cost_usd": cost, "policy": self.loaded.hash}
+        if p.fallback_from:
+            info |= {"fallback_from": p.fallback_from, "fallback_error": p.fallback_error}
         if resp is not None:
             hp = getattr(resp, "_hidden_params", None)
             if isinstance(hp, dict):
@@ -327,7 +367,8 @@ class Wrapper:
                                  | self._recorded_response_format(p, rec)),
             "metadata_json": dumps(p.caller_metadata | {"wrapper": info}),
             "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
-            "cached_tokens": usage.get("cached_tokens"), "cost_usd": cost, "latency_ms": (time.time() - p.started) * 1000,
+            "cached_tokens": usage.get("cached_tokens"), "cache_write_tokens": usage.get("cache_write_tokens"),
+            "cost_usd": cost, "latency_ms": (time.time() - p.started) * 1000,
             "finish_reason": resp.choices[0].finish_reason if resp is not None else None, "error": error,
             "content_hash": None, "run_tag": self.run_tag,
         })
@@ -369,7 +410,7 @@ class Wrapper:
         })
 
 
-_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens")
+_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_write_tokens")
 
 
 def _usage_of(resp: Any) -> dict[str, int]:
@@ -382,6 +423,11 @@ def _usage_of(resp: Any) -> dict[str, int]:
     if cached is None:  # DeepSeek's own field
         cached = getattr(u, "prompt_cache_hit_tokens", None)
     out["cached_tokens"] = int(cached or 0)
+    # tokens written to the provider's cache (Anthropic bills them above the normal input price)
+    written = getattr(u, "cache_creation_input_tokens", None)
+    if not written and details is not None:
+        written = getattr(details, "cache_creation_tokens", None) or getattr(details, "cache_write_tokens", None)
+    out["cache_write_tokens"] = int(written or 0)
     return out
 
 
@@ -392,11 +438,12 @@ def _add_usage(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
 def _litellm_usage(u: dict[str, int]) -> Any:
     return litellm.Usage(prompt_tokens=u.get("prompt_tokens", 0), completion_tokens=u.get("completion_tokens", 0),
                          total_tokens=u.get("total_tokens", 0),
-                         prompt_tokens_details={"cached_tokens": u.get("cached_tokens", 0)})
+                         prompt_tokens_details={"cached_tokens": u.get("cached_tokens", 0)},
+                         cache_creation_input_tokens=u.get("cache_write_tokens", 0))
 
 
 def _usage_block(u: dict[str, int]) -> dict[str, int] | None:
-    return {k: v for k, v in u.items() if k != "cached_tokens"} if u else None
+    return {k: v for k, v in u.items() if k not in ("cached_tokens", "cache_write_tokens")} if u else None
 
 
 def _chunk(text: str, finished: bool = False, finish_reason: str = "", usage=None, tool_use=None) -> dict:

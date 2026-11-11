@@ -57,7 +57,7 @@ CREATE INDEX IF NOT EXISTS import_path ON import_batches(path, fingerprint);
 """
 
 
-MIGRATIONS = {"requests": {"cached_tokens": "INTEGER", "run_tag": "TEXT"}}
+MIGRATIONS = {"requests": {"cached_tokens": "INTEGER", "run_tag": "TEXT", "cache_write_tokens": "INTEGER"}}
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

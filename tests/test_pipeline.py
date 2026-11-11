@@ -296,3 +296,197 @@ async def test_response_format_leak_check_and_reroute_guard(make_wrapper):
     await w.acomplete(big, {"response_format": schema}, {})
     assert fake.calls[0]["model"] == "openai/gpt-4.1"   # rerouted to an untrusted model
     assert "jane@acme.com" not in json.dumps(fake.calls[0]["response_format"])
+
+
+async def test_cache_control_markers_survive_redaction(make_wrapper):
+    fake = FakeModel()
+    w = make_wrapper(fake)
+    msgs = [{"role": "system", "content": [
+                {"type": "text", "text": "Long context about jane@acme.com", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "second part"}]},
+            {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}]
+    await w.acomplete(msgs, {}, {})
+    sent = fake.calls[0]["messages"]
+    assert sent[0]["content"][0]["cache_control"] == {"type": "ephemeral"}      # same part, same value
+    assert "cache_control" not in sent[0]["content"][1]
+    assert sent[1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "jane@acme.com" not in fake.sent and "<EMAIL_" in sent[0]["content"][0]["text"]
+
+
+async def test_hint_with_list_system_content_is_appended_not_a_new_message(make_wrapper):
+    fake = FakeModel()
+    w = make_wrapper(fake)
+    msgs = [{"role": "system", "content": [{"type": "text", "text": "Mail jane@acme.com",
+                                            "cache_control": {"type": "ephemeral"}}]},
+            {"role": "user", "content": "hi"}]
+    await w.acomplete(msgs, {}, {})
+    sent = fake.calls[0]["messages"]
+    assert [m["role"] for m in sent] == ["system", "user"]            # no extra system message in front
+    parts = sent[0]["content"]
+    assert len(parts) == 2 and parts[1]["text"].strip().startswith("Some values are replaced")
+    assert parts[0]["cache_control"] == {"type": "ephemeral"}          # the cached part is untouched
+
+
+async def test_cache_write_tokens_recorded_and_priced(make_wrapper, store):
+    import litellm as ll
+    model = "claude-haiku-4-5-20251001"
+
+    def reply_with(creation):
+        async def f(**kw):
+            r = await FakeModel.__call__(FakeModel(), **kw)
+            r.usage = ll.Usage(prompt_tokens=100, completion_tokens=10, total_tokens=110,
+                               cache_creation_input_tokens=creation, cache_read_input_tokens=20)
+            return r
+        return f
+
+    w = make_wrapper(FakeModel(), models={"default": model})
+    w.acompletion = reply_with(40)
+    resp = await w.acomplete([{"role": "user", "content": "x"}], {}, {})
+    w.acompletion = reply_with(0)
+    await w.acomplete([{"role": "user", "content": "y"}], {}, {})
+    store.flush()
+    rows = store.query("SELECT cached_tokens, cache_write_tokens, cost_usd FROM requests ORDER BY ts")
+    with_write, without = rows[0], rows[1]
+    assert (with_write["cached_tokens"], with_write["cache_write_tokens"]) == (20, 40)
+    assert without["cache_write_tokens"] == 0
+    assert with_write["cost_usd"] > without["cost_usd"]          # cache writes cost more than plain input
+    exp_in, exp_out = ll.cost_per_token(model=model, prompt_tokens=100, completion_tokens=10,
+                                        cache_read_input_tokens=20, cache_creation_input_tokens=40)
+    assert with_write["cost_usd"] == pytest.approx(exp_in + exp_out)
+    assert resp.choices[0].message.content
+
+
+def test_older_databases_gain_the_cache_write_column(tmp_path):
+    import sqlite3
+    from llm_wrapper.storage import Store
+    p = str(tmp_path / "old.db")
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE requests (id TEXT PRIMARY KEY, ts REAL, source TEXT, session_key TEXT, user TEXT, "
+              "model_requested TEXT, model_used TEXT, route_id TEXT, policy_hash TEXT, fast_path INTEGER, "
+              "stream INTEGER, input_json TEXT, output_json TEXT, params_json TEXT, metadata_json TEXT, "
+              "prompt_tokens INTEGER, completion_tokens INTEGER, cost_usd REAL, latency_ms REAL, "
+              "finish_reason TEXT, error TEXT, content_hash TEXT)")
+    c.commit()
+    c.close()
+    s = Store(p)
+    cols = {r["name"] for r in s.query("PRAGMA table_info(requests)")}
+    s.close()
+    assert {"cached_tokens", "cache_write_tokens", "run_tag"} <= cols
+
+
+class FailsFor(FakeModel):
+    """Raises the given LiteLLM error for the listed models; answers normally for any other."""
+
+    def __init__(self, models, error, **kw):
+        super().__init__(**kw)
+        self.models, self.error = set(models), error
+
+    async def __call__(self, **kw):
+        if kw["model"] in self.models:
+            self.calls.append(kw)
+            raise self.error(message="boom", model=kw["model"], llm_provider="openai")
+        return await super().__call__(**kw)
+
+
+ROUTE_TO_WEIRD = [{"id": "r", "when": "true", "model": "openai/weird"}]
+
+
+def _fb(**over):
+    return {"fallback": {"enabled": True} | over, "routes": ROUTE_TO_WEIRD}
+
+
+async def test_fallback_retries_once_on_the_default_model_and_records_one_row(make_wrapper, store):
+    for err in (litellm.BadRequestError, litellm.NotFoundError, litellm.AuthenticationError):
+        fake = FailsFor(["openai/weird"], err)
+        w = make_wrapper(fake, **_fb())
+        resp = await w.acomplete([{"role": "user", "content": "hi"}], {}, {})
+        assert [c["model"] for c in fake.calls] == ["openai/weird", "openai/gpt-4o-mini"]
+        assert resp.choices[0].message.content == "ok"
+        assert resp._hidden_params["wrapper"]["fallback_from"] == "openai/weird"
+        assert resp._hidden_params["wrapper"]["fallback_error"] == err.__name__
+    store.flush()
+    rows = store.query("SELECT model_used, route_id, error, metadata_json, id FROM requests")
+    assert len(rows) == 3 and all(r["model_used"] == "openai/gpt-4o-mini" and r["error"] is None for r in rows)
+    assert all(r["route_id"] == "fallback" for r in rows)
+    assert json.loads(rows[0]["metadata_json"])["wrapper"]["fallback_from"] == "openai/weird"
+    spans = {s["name"] for s in store.query("SELECT name FROM spans WHERE request_id=?", (rows[0]["id"],))}
+    assert "fallback" in spans
+
+
+async def test_fallback_off_by_default_and_error_reaches_the_caller_unchanged(make_wrapper, store):
+    fake = FailsFor(["openai/weird"], litellm.BadRequestError)
+    w = make_wrapper(fake, routes=ROUTE_TO_WEIRD)             # fallback not configured at all
+    with pytest.raises(litellm.BadRequestError):
+        await w.acomplete([{"role": "user", "content": "hi"}], {}, {})
+    assert len(fake.calls) == 1
+    w = make_wrapper(fake, routes=ROUTE_TO_WEIRD, fallback={"enabled": False})
+    with pytest.raises(litellm.BadRequestError):
+        await w.acomplete([{"role": "user", "content": "hi"}], {}, {})
+    store.flush()
+    assert all(r["error"].startswith("BadRequestError") for r in store.query("SELECT error FROM requests"))
+
+
+async def test_fallback_not_used_when_the_failing_model_is_the_target_or_forced_or_kind_not_listed(make_wrapper):
+    fake = FailsFor(["openai/gpt-4o-mini"], litellm.BadRequestError)       # the default itself fails
+    w = make_wrapper(fake, fallback={"enabled": True})
+    with pytest.raises(litellm.BadRequestError):
+        await w.acomplete([{"role": "user", "content": "hi"}], {}, {})
+    assert len(fake.calls) == 1
+    fake = FailsFor(["openai/weird"], litellm.BadRequestError)
+    w = make_wrapper(fake, **_fb())
+    with pytest.raises(litellm.BadRequestError):                           # forced calls (experiments) never fall back
+        await w.acomplete([{"role": "user", "content": "hi"}], {}, {}, force_model="openai/weird")
+    assert len(fake.calls) == 1
+    fake = FailsFor(["openai/weird"], litellm.NotFoundError)
+    w = make_wrapper(fake, **_fb(on=["bad_request"]))
+    with pytest.raises(litellm.NotFoundError):
+        await w.acomplete([{"role": "user", "content": "hi"}], {}, {})
+    assert len(fake.calls) == 1
+
+
+async def test_fallback_never_for_context_window_content_policy_timeout_or_rate_limit(make_wrapper):
+    for err in (litellm.ContextWindowExceededError, litellm.ContentPolicyViolationError, litellm.RateLimitError,
+                litellm.Timeout):
+        fake = FailsFor(["openai/weird"], err)
+        w = make_wrapper(fake, **_fb())
+        with pytest.raises(err):
+            await w.acomplete([{"role": "user", "content": "hi"}], {}, {})
+        assert len(fake.calls) == 1, err.__name__
+
+
+async def test_fallback_target_is_redacted_according_to_its_own_trust(make_wrapper):
+    fake = FailsFor(["openai/weird"], litellm.BadRequestError)
+    w = make_wrapper(fake, privacy={"trusted": ["openai/gpt-4o-mini"]}, **_fb())
+    await w.acomplete([{"role": "user", "content": "mail jane@acme.com"}], {}, {})
+    first, second = fake.calls
+    assert "jane@acme.com" not in json.dumps(first["messages"]) and "<EMAIL_" in json.dumps(first["messages"])
+    assert "jane@acme.com" in json.dumps(second["messages"])               # the trusted fallback gets the real value
+    fake = FailsFor(["openai/weird"], litellm.BadRequestError)
+    w = make_wrapper(fake, privacy={"trusted": ["openai/weird"]}, **_fb(to="openai/other"))
+    await w.acomplete([{"role": "user", "content": "mail jane@acme.com"}], {}, {})
+    assert "jane@acme.com" in json.dumps(fake.calls[0]["messages"])
+    assert "jane@acme.com" not in json.dumps(fake.calls[1]["messages"])    # untrusted fallback: redacted
+
+
+def test_fallback_policy_validation():
+    from llm_wrapper.policy import policy_from_dict
+    from .conftest import base_policy
+    with pytest.raises(Exception, match="wrapper itself"):
+        policy_from_dict(base_policy(fallback={"enabled": True, "to": "wrapper/auto"}))
+    with pytest.raises(Exception):
+        policy_from_dict(base_policy(fallback={"on": ["timeout"]}))
+    assert policy_from_dict(base_policy()).policy.fallback.enabled is False
+
+
+def test_fallback_on_key_written_unquoted_in_yaml(tmp_path):
+    from llm_wrapper.policy import load_policy
+    f = tmp_path / "p.yaml"
+    f.write_text("version: 1\nmodels: {default: m}\nfallback:\n  enabled: true\n  on: [not_found]\n  to: other/model\n")
+    fb = load_policy(f).policy.fallback          # YAML 1.1 reads the bare key `on` as the boolean True
+    assert fb.enabled and fb.on == ["not_found"] and fb.to == "other/model"
+    f.write_text('version: 1\nmodels: {default: m}\nfallback:\n  "on": [auth]\n')
+    assert load_policy(f).policy.fallback.on == ["auth"]
+    lp = load_policy(tmp_path / "p.yaml")        # the effective policy (what `ab` writes to disk) loads again
+    g = tmp_path / "eff.yaml"
+    g.write_text(lp.effective_yaml)
+    assert load_policy(g).policy.fallback.on == ["auth"]

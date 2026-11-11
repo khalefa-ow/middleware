@@ -19,8 +19,12 @@ restored on the way back, and traced to a local SQLite file.
 | Storage | SQLite WAL, background writer, 0600 file; requests, spans, egress/size events, redactions, vault, policy versions |
 | Ops | `wrapper init / validate / import-cppagent / import-chat / analyze / bench / delete / purge / health / show` |
 
-Not built yet: outcome scorers (e.g. build-and-compare for cppagent), dry-run replay, submitting
-fine-tuning jobs, learning, proxy spend de-duplication test.
+Provider prompt caching: stable prefixes, cached-token and cache-write pricing, `cache_control` markers kept
+on their parts through redaction. Opt-in `fallback:` retries once on `models.default` when the routed model
+fails on a bad request, unknown model or bad credentials (see `starter_policy.yaml`; not for streaming).
+
+Not built yet: submitting fine-tuning jobs, learning, the proxy spend de-duplication test, the cppagent
+metadata contract (`role`, `session_id`, `task_id`).
 
 ## Use
 ```bash
@@ -172,5 +176,5 @@ With `storage.record_inputs: false` the gateway keeps no prompts, answers or vau
 hashes (so `wrapper delete --value` still finds the requests).
 
 ## Tests
-`.venv/bin/pytest -q` (89 tests, no network, about a minute: the model is faked at `Wrapper.acompletion`; the A/B tests
+`.venv/bin/pytest -q` (101 tests, no network, about a minute: the model is faked at `Wrapper.acompletion`; the A/B tests
 start a few child Python processes).

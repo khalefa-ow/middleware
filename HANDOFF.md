@@ -537,3 +537,11 @@ When section 5 is finished (or you stop early), give the user:
   per-role route could not match); success uses `^Success: True` on stdout (cppagent prints it once, for the last stage
   it ran); commands run in their own process group so a timeout kills child processes too. The suite now takes about a
   minute because the A/B tests start child Python processes. 89 tests pass.
+- 2026-11-11: T14-T15 done. `cache_control` markers verified to survive redaction (no fix needed); `add_hint` appends a
+  text part when the system content is a list; cache-write tokens read from `Usage.cache_creation_input_tokens` /
+  `prompt_tokens_details.cache_creation_tokens` (checked in the installed LiteLLM 1.108.4), stored in
+  `requests.cache_write_tokens` and priced via `cost_per_token(cache_creation_input_tokens=...)`. Opt-in `fallback:`
+  (`Fallback` in `policy.py`, `Wrapper._fallback_target`). Deviations: content-policy errors are also excluded (they
+  subclass `BadRequestError` and a retry elsewhere would route around a refusal); an unquoted `on:` in YAML is the
+  boolean True, so `Fallback` accepts that spelling as the `on` key; if preparing for the fallback fails, the
+  original error is raised. `wrapper ab report` on a database without A/B tables gives a clear error. 101 tests pass.

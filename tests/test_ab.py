@@ -121,3 +121,13 @@ def test_example_cppagent_spec_and_policies_load(monkeypatch):
         models.append(lp.policy.models.default)
     assert models == ["deepseek/deepseek-chat", "openai/gpt-6-luna"]
     assert spec.success.stdout_regex == "^Success: True" and spec.arms[0].id == "deepseek"
+
+
+def test_ab_report_on_a_database_without_ab_tables_is_a_clear_error(tmp_path, capsys):
+    from llm_wrapper.cli import main
+    s = Store(str(tmp_path / "empty.db"))
+    with pytest.raises(ValueError, match="no A/B experiment named 'nope'"):
+        ab.ab_report(s, "nope")
+    s.close()
+    assert main(["--db", str(tmp_path / "empty.db"), "ab", "report", "nope"]) == 1
+    assert "no A/B experiment named" in capsys.readouterr().err

@@ -31,6 +31,7 @@ import os
 import random
 import re
 import signal
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -230,7 +231,10 @@ def bootstrap_diff(a: list[float], b: list[float], n: int = 2000, seed: int = 0,
 
 
 def ab_report(store: Store, experiment_id: str) -> dict[str, Any]:
-    spec_row = store.query("SELECT spec_yaml FROM ab_experiments WHERE id=?", (experiment_id,))
+    try:
+        spec_row = store.query("SELECT spec_yaml FROM ab_experiments WHERE id=?", (experiment_id,))
+    except sqlite3.OperationalError:  # a database that has never run an A/B has no such table
+        spec_row = []
     if not spec_row:
         raise ValueError(f"no A/B experiment named {experiment_id!r}")
     spec = ABSpec.model_validate(yaml.safe_load(spec_row[0]["spec_yaml"]))

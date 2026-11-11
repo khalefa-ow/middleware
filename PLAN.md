@@ -36,13 +36,15 @@ The gateway also:
 ## 2. Status
 | Part | State |
 |---|---|
-| v1 prototype | Built in `llm_wrapper/`: provider (sync, async, streaming), routing rules, redaction and restore, size checks, SQLite tracing, CLI. The whole suite (89 offline tests) passes with `.venv/bin/pytest -q` |
+| v1 prototype | Built in `llm_wrapper/`: provider (sync, async, streaming), routing rules, redaction and restore, size checks, SQLite tracing, CLI. The whole suite (101 offline tests) passes with `.venv/bin/pytest -q` |
 | Live validation (M1) | **Done** (2026-11-10). A live DeepSeek call redacted an email and a phone, restored both, streaming worked. Fastlanes stage 2 through `wrapper/auto`: 10 calls, task passed, the wrapper's token totals equal cppagent's exactly, the provider's `response_format` rejection reached cppagent unchanged. (The direct control run failed stage 2; with n = 1 each this is chance, not a wrapper effect) |
 | Overhead (M2) | **Done.** `wrapper bench` on all 533 fastlanes prompts: p50 2.4 ms, p95 5.2 ms, p99 9.6 ms (after skipping exact token counts when a byte-length bound already fits; before: p95 38 ms) |
 | Trace import | cppagent importer, plus a generic OpenAI-chat importer (`import-chat`), which turns each assistant turn into one call with its exact cached-prefix tokens |
 | Phase-0 analysis | Run on fastlanes, 300 public coding-agent runs and 500 public chats (§3) |
 | Prompt caching through the gateway | **Verified live.** The redacted prefix is byte-identical across turns, so DeepSeek cache hits continue (3,200 of about 3,370 tokens). Cached tokens are recorded and priced with the cache discount |
-| Experiment engine | **Built** (`wrapper experiment run spec.yaml`): sampled replay, arms, scorers (`json_valid`, `similarity`, blind order-randomized judge with spend cap), control-arm comparison, promotion proposal. Replays reuse the caller's recorded params. Reports carry bootstrap 95% CIs and a paired comparison with the control arm; promotion requires the CI to clear the bar |
+| Experiment engine | **Built** (`wrapper experiment run spec.yaml`): sampled replay, arms, scorers (`json_valid`, `similarity`, blind order-randomized judge with spend cap), control-arm comparison, promotion proposal. Replays reuse the caller's recorded params, including a recorded `response_format` schema. `--dry` estimates a run with no model calls; `--limit N` sets the sample size; arms can change the system prompt or transform the messages; scorer plugins (`python:module:fn`) and a `primary` scorer drive promotion. Reports carry bootstrap 95% CIs and a paired comparison with the control arm; promotion requires the CI to clear the bar |
+| Run-level A/B (M5b) | **Built** (`wrapper ab run|report`): the caller's own command N times per arm under each arm's policy, calls tagged by `requests.run_tag`, success rate with Wilson intervals, cost per successful run, bootstrap CI vs the control. Tested offline with a child process and a fake model. The cppagent example in `examples/cppagent_ab/` is written but **not run** (it calls real models; needs the owner's go-ahead) |
+| Gateway cost levers (M8, M10) | **Built.** `cache_control` markers survive redaction; cache-write tokens recorded and priced; opt-in `fallback:` retries once on the default model after a bad-request, not-found or auth error |
 | Fine-tune export | **Built** (`wrapper export-finetune`): OpenAI chat JSONL, redacted with per-sample placeholders, train/holdout split stored so experiments evaluate on holdout only (`dataset.holdout_of`). Targets are logged answers (optionally successful runs only) or judge-preferred answers of a stronger arm (distillation). On fastlanes only 13–15 successful examples per role exist: too few to tune on (§3) |
 
 ## 3. Evidence and validation gates
@@ -206,9 +208,9 @@ Each version ships only when its acceptance criteria (§8) pass on the replay se
 - **M7 analysis on production traffic:** decide H1, H2, H5. **Re-plan after M7.**
 
 ### v2: Cost levers that need no learning
-- **M8 prompt-cache awareness:** stable prefixes and cached-token pricing are done. Still to do: a test that provider cache markers (`cache_control`) pass through redaction untouched, and pricing of cache-write tokens.
+- **M8 prompt-cache awareness (built):** stable prefixes, cached-token pricing, a test that `cache_control` markers pass through redaction untouched, the placeholder hint appended as a last part (not a new message) when the system content is a list, and cache-write tokens recorded (`requests.cache_write_tokens`) and priced at the provider's write rate.
 - **M9 exact response cache:** keyed by redacted payload and model, only for `temperature == 0` or callers that opt in. cppagent already caches, so this is for other callers.
-- **M10 error-aware fallback:** on non-transient errors from the routed model (`response_format` rejected, model not found), retry once on `models.default` and record the event. Turn repeated failures into route warnings.
+- **M10 error-aware fallback (built, opt-in, `fallback:` in the policy):** on a bad-request, not-found or auth error from the routed model, retry once on `models.default` (or `fallback.to`), re-prepared for the target's trust level, and record `fallback_from` / `fallback_error` and a `fallback` span. Never for timeouts, rate limits, context-window or content-policy errors, forced calls or streaming. Still to do: turn repeated fallbacks into route warnings.
 - **M11 role routing:** policy routes by `metadata.role`, each with a replay gate. Fastlanes candidates: `planner` and `context` (short outputs, 100% parse rate) to a cheaper model; `repair` measured against its outcome.
 
 ### v3: Quality signal

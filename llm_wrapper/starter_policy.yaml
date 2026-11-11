@@ -65,3 +65,12 @@ storage:
   path: ~/.llm_wrapper/wrapper.db
   record_inputs: true           # store real inputs/outputs and vault values locally (encrypted disk recommended);
                                 # false keeps only hashes (vault values are not stored either)
+
+# Opt-in: when the routed model fails on a configuration error (a rejected parameter, model not found, bad
+# credentials), retry once on another model. Never for timeouts, rate limits, context-window or content-policy
+# errors, never for forced calls (experiments), never when the failing model already is the target, and not
+# for streaming requests. The caller's own error is returned unchanged when this is off (the default).
+fallback:
+  enabled: false
+  on: [bad_request, not_found, auth]
+  to: null                      # null = models.default

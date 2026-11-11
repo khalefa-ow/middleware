@@ -94,6 +94,25 @@ class Storage(_Strict):
     record_inputs: bool = True
 
 
+class Fallback(_Strict):
+    """Opt-in: one retry on ``to`` when the routed model fails on a configuration error."""
+    enabled: bool = False
+    on: list[Literal["bad_request", "not_found", "auth"]] = ["bad_request", "not_found", "auth"]
+    to: str | None = None
+    """Fallback model; null means ``models.default``."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _yaml_on_key(cls, data: Any) -> Any:
+        """An unquoted ``on:`` is the boolean True in YAML 1.1; read it as the ``on`` key."""
+        if isinstance(data, dict) and True in data:
+            data = dict(data)
+            if "on" in data:
+                raise ValueError("fallback has both 'on' and a boolean key (an unquoted 'on:' is read as true by YAML)")
+            data["on"] = data.pop(True)
+        return data
+
+
 class Policy(_Strict):
     version: int = 1
     models: Models
@@ -103,10 +122,13 @@ class Policy(_Strict):
     limits: Limits = Limits()
     retention: Retention = Retention()
     storage: Storage = Storage()
+    fallback: Fallback = Fallback()
 
     @model_validator(mode="after")
     def _no_self_calls(self) -> "Policy":
         targets = [self.models.default, *self.models.large_context, *(r.model for r in self.routes)]
+        if self.fallback.to:
+            targets.append(self.fallback.to)
         for t in targets:
             if t.startswith(WRAPPER_PREFIX):
                 raise ValueError(f"target model {t!r} would call the wrapper itself")

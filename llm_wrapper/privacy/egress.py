@@ -128,11 +128,20 @@ def leak_check(payload: Any, vault: Vault) -> list[str]:
 
 
 def add_hint(messages: list[dict]) -> list[dict]:
-    """Append the keep-placeholders instruction to the first system message (or add one)."""
+    """Append the keep-placeholders instruction to the first system message (or add one).
+
+    A system message with list content gets one extra text part at the end: inserting a new message at the
+    front would shift a provider-cached prefix (and a ``cache_control`` marker stays on its own part)."""
     msgs = list(messages)
     for i, m in enumerate(msgs):
-        if m.get("role") == "system" and isinstance(m.get("content"), str):
-            msgs[i] = {**m, "content": m["content"].rstrip() + "\n\n" + HINT}
+        if m.get("role") != "system":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            msgs[i] = {**m, "content": content.rstrip() + "\n\n" + HINT}
+            return msgs
+        if isinstance(content, list):
+            msgs[i] = {**m, "content": [*content, {"type": "text", "text": HINT}]}
             return msgs
     return [{"role": "system", "content": HINT}, *msgs]
 
