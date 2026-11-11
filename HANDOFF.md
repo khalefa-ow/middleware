@@ -514,3 +514,8 @@ When section 5 is finished (or you stop early), give the user:
   earlier experiments (their replays and judge prompts carried the caller's role and were
   being sampled as caller traffic); examples and scripts moved from scratch space into
   `examples/`, `scripts/` and `var/`. 65 tests pass.
+- 2026-11-11: T1-T5 done. Vault value is `NULL` when `record_inputs` is false; `astream` records refused
+  requests; connections are closed (`store_conn` is now a closing context manager, `Store` uses
+  `contextlib.closing`); export skips non-text examples; budget skips are recorded (`skipped_budget`)
+  and unsafe roles get no route. 70 tests pass. Local git repo created (commit 890d28d); no remote (no `gh`
+  or token on this machine).

@@ -71,3 +71,15 @@ def test_bootstrap_and_paired():
     ctl = [{"sample_id": i, "ok": 1, "judge": 0.0} for i in range(10)]
     d = ex._paired(arm, ctl, "judge")
     assert d["n"] == 10 and d["mean"] == 1.0 and d["ci95"][0] > 0
+
+
+def test_export_skips_examples_with_non_text_messages(store, tmp_path):
+    _seed(store, 3)
+    multi = [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {}}]}]
+    store.put("requests", {"id": "zz", "ts": 99, "source": "own_import", "model_used": "m",
+                           "input_json": json.dumps(multi),
+                           "output_json": json.dumps({"role": "assistant", "content": "seen"}),
+                           "metadata_json": json.dumps({"role": "planner"})})
+    store.flush()
+    st = export_finetune(store, "nt", str(tmp_path), Dataset(role="planner"), holdout=0)
+    assert st.train == 3 and st.skipped_non_text == 1

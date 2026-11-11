@@ -221,3 +221,33 @@ async def test_prefix_byte_stable_across_turns_and_cached_tokens_recorded(make_w
     store.flush()
     rows = store.query("SELECT cached_tokens, cost_usd FROM requests")
     assert [r["cached_tokens"] for r in rows] == [80, 80, 80]
+
+
+async def test_record_inputs_false_keeps_raw_values_out_of_every_table(make_wrapper, store):
+    from llm_wrapper.privacy import value_hash
+    fake = FakeModel()
+    w = make_wrapper(fake, storage={"record_inputs": False})
+
+    async def echo(**kw):
+        ph = kw["messages"][-1]["content"].split()[1]
+        fake.replies = [f"Sent to {ph}."]
+        return await FakeModel.__call__(fake, **kw)
+    w.acompletion = echo
+    resp = await w.acomplete(MSGS, {}, {})
+    assert "jane@acme.com" in resp.choices[0].message.content  # caller still gets the restored value
+    store.flush()
+    for table in ("requests", "vault", "redactions", "spans", "egress_events", "size_events", "vault_refs"):
+        for row in store.query(f"SELECT * FROM {table}"):
+            assert "jane@acme.com" not in json.dumps([str(v) for v in tuple(row)]), table
+    assert store.query("SELECT count(*) AS n FROM vault")[0]["n"] >= 1
+    assert len(store.requests_with_value(value_hash("jane@acme.com"))) == 1
+
+
+async def test_stream_refused_before_model_call_is_recorded(make_wrapper, store):
+    w = make_wrapper(FakeModel(), size={"limits": {"openai/gpt-4o-mini": 1000}, "reserve_output_tokens": 100})
+    big = [{"role": "user", "content": "word " * 3000}]
+    with pytest.raises(ContextTooLarge):
+        _ = [c async for c in w.astream(big, {"stream": True}, {})]
+    store.flush()
+    rows = store.query("SELECT * FROM requests")
+    assert len(rows) == 1 and rows[0]["error"].startswith("ContextTooLarge") and rows[0]["input_json"] is None

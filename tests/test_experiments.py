@@ -98,3 +98,36 @@ def test_sample_skips_experiment_rows(store):
     store.flush()
     assert {s["id"] for s in ex.sample(store, ex.Dataset(role="planner"))} == {"r0", "r1"}
     assert {s["id"] for s in ex.sample(store, ex.Dataset(source="experiment"))} == {"judge1"}
+
+
+async def test_budget_exhausted_is_recorded_not_silent(make_wrapper, store, tmp_path):
+    _seed(store, 3)
+    fake = Scripted()
+    w = make_wrapper(fake)
+    p = tmp_path / "b.yaml"
+    p.write_text(yaml.safe_dump({"id": "b0", "dataset": {"role": "planner"}, "budget_usd": 0,
+                                 "arms": [{"id": "mini", "model": "openai/gpt-4o-mini"}]}))
+    rep = await ex.run_experiment(w, store, str(p))
+    assert fake.calls == []
+    a = rep["arms"]["mini"]
+    assert (a["n"], a["skipped_budget"], a["errors"]) == (3, 3, 0)
+    assert "skipped" in ex.format_report(rep)
+    rows = store.query("SELECT error, ok FROM experiment_results WHERE experiment_id='b0'")
+    assert {(r["error"], r["ok"]) for r in rows} == {("budget exhausted", 0)}
+
+
+async def test_promotion_refuses_unsafe_role(make_wrapper, store, tmp_path):
+    _seed(store)
+    w = make_wrapper(Scripted())
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump({"id": "safe", "dataset": {"role": "planner"},
+                                 "arms": [{"id": "a", "model": "openai/gpt-4o-mini"},
+                                          {"id": "b", "model": "openai/gpt-4o-mini"}]}))
+    await ex.run_experiment(w, store, str(p))
+    rep = ex.report(store, "safe")
+    rep["arms"]["b"] |= {"judged": 50, "judge_score": 0.9, "judge_ci95": [0.8, 1.0], "mean_cost_usd": 0.1,
+                         "json_valid": 1.0, "vs_control": {}}
+    rep["arms"]["a"]["mean_cost_usd"] = 1.0
+    assert "routes:" in ex.promotion_snippet(rep, "planner")
+    out = ex.promotion_snippet(rep, "it's")
+    assert "routes:" not in out and "by hand" in out

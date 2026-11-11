@@ -192,7 +192,8 @@ def cmd_export_finetune(args) -> int:
     stats = export_finetune(st, args.name, args.out, ds, select=args.select, require_success=args.require_success,
                             holdout=args.holdout, redact=not args.no_redact)
     print(f"candidates {stats.candidates} | train {stats.train} | holdout {stats.holdout} | "
-          f"skipped (no success {stats.skipped_no_success}, tool calls {stats.skipped_tools}) | "
+          f"skipped (no success {stats.skipped_no_success}, tool calls {stats.skipped_tools}, "
+          f"non-text {stats.skipped_non_text}) | "
           f"redactions {stats.redactions} | ~{stats.approx_train_tokens} train tokens")
     for f in stats.files:
         print(f"  wrote {f}")

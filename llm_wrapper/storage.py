@@ -8,6 +8,7 @@ locally; keep the file on an encrypted disk (it is created 0600).
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import os
 import queue
@@ -91,7 +92,7 @@ class Store:
 
     def __init__(self, path: str):
         self.path = path
-        with connect(path) as c:
+        with contextlib.closing(connect(path)) as c, c:
             c.executescript(SCHEMA)
             _migrate(c)
         self._q: queue.Queue = queue.Queue()
@@ -147,7 +148,7 @@ class Store:
 
     # -- reads / maintenance (synchronous)
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
-        with connect(self.path) as c:
+        with contextlib.closing(connect(self.path)) as c:
             return c.execute(sql, list(params)).fetchall()
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> int:

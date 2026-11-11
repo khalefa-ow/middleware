@@ -244,7 +244,12 @@ class Wrapper:
             yield _chunk(msg.content or "", finished=True, finish_reason=resp.choices[0].finish_reason or "stop",
                          usage=_usage_block(_usage_of(resp)))
             return
-        p = self.prepare(messages, params, metadata)
+        try:
+            p = self.prepare(messages, params, metadata)
+        except Exception as exc:
+            if self.store:
+                self._record_failed_prepare(messages, params, metadata, exc)
+            raise
         restorer = StreamRestorer(p.vault, self.policy.privacy.response_values)
         t1 = time.time()
         usage: dict[str, int] = {}
@@ -330,7 +335,9 @@ class Wrapper:
                                "success": int(error is None), "detail": None, "ts": time.time()})
         for e in p.vault.by_placeholder.values():
             vh = value_hash(e.value)
-            st.put("vault", {"placeholder": e.placeholder, "scope_key": p.vault.scope_key, "value": e.value,
+            # with record_inputs off, keep only the hash (enough for delete-by-value), never the raw value
+            st.put("vault", {"placeholder": e.placeholder, "scope_key": p.vault.scope_key,
+                             "value": e.value if rec else None,
                              "value_hash": vh, "type": e.type, "origin": e.origin,
                              "key_version": p.vault.key_version, "created": time.time()})
             st.put("vault_refs", {"value_hash": vh, "request_id": p.request_id})

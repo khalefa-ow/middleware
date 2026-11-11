@@ -37,6 +37,7 @@ class ExportStats:
     holdout: int = 0
     skipped_no_success: int = 0
     skipped_tools: int = 0
+    skipped_non_text: int = 0
     redactions: int = 0
     approx_train_tokens: int = 0
     files: list[str] = field(default_factory=list)
@@ -79,8 +80,12 @@ def export_finetune(store: Store, name: str, out_dir: str, dataset: Dataset, sel
         answer = targets.get(r["id"]) if targets is not None else out.get("content")
         if not answer:
             continue
-        msgs = [{"role": m.get("role"), "content": m.get("content")} for m in json.loads(r["input_json"])
-                if isinstance(m.get("content"), str)]
+        prompt = json.loads(r["input_json"])
+        if any(not isinstance(m.get("content"), str) or m.get("role") == "tool" or m.get("tool_calls")
+               for m in prompt):
+            stats.skipped_non_text += 1  # a partial prompt would teach the wrong thing; skip the whole example
+            continue
+        msgs = [{"role": m.get("role"), "content": m["content"]} for m in prompt]
         msgs.append({"role": "assistant", "content": answer})
         if redact:
             vault, rep = Vault(key, f"{name}:{r['id']}"), RedactionReport()

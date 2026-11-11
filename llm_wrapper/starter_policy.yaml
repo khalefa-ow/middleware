@@ -63,4 +63,5 @@ retention:
 
 storage:
   path: ~/.llm_wrapper/wrapper.db
-  record_inputs: true           # store real inputs/outputs locally (encrypted disk recommended)
+  record_inputs: true           # store real inputs/outputs and vault values locally (encrypted disk recommended);
+                                # false keeps only hashes (vault values are not stored either)

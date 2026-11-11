@@ -22,11 +22,17 @@ Example spec:
     judge: {model: openai/gpt-4.1, max_usd: 0.50}
     budget_usd: 1.00
     concurrency: 4
+
+Budgets: ``budget_usd`` caps the arm calls only; the judge has its own cap (``judge.max_usd``).
+Calls already in flight when a cap is reached still finish, so spend can overshoot by up to
+``concurrency`` calls. Samples not run because the budget was spent get a result row with
+``error = "budget exhausted"`` and show up as ``skipped_budget`` in the report.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import json
 import random
@@ -81,6 +87,8 @@ class Spec(_Strict):
     budget_usd: float = 1.0
     concurrency: int = Field(4, ge=1, le=32)
 
+
+BUDGET_ERROR = "budget exhausted"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS experiments (id TEXT PRIMARY KEY, spec_yaml TEXT, started REAL, finished REAL, status TEXT);
@@ -241,6 +249,9 @@ class Runner:
     async def _one(self, sem: asyncio.Semaphore, s: dict, arm: Arm) -> None:
         async with sem:
             if self.spent >= self.spec.budget_usd:
+                self.store.put("experiment_results", {
+                    "experiment_id": self.spec.id, "arm_id": arm.id, "sample_id": s["id"], "model": arm.model,
+                    "ts": time.time(), "ok": 0, "error": BUDGET_ERROR})
                 return
             messages = json.loads(s["input_json"])
             if arm.system_suffix:
@@ -291,9 +302,16 @@ class Runner:
         return samples
 
 
+@contextlib.contextmanager
 def store_conn(store: Store):
+    """A short-lived connection that commits on success and is always closed."""
     from .storage import connect
-    return connect(store.path)
+    conn = connect(store.path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _with_suffix(messages: list[dict], suffix: str) -> list[dict]:
@@ -372,7 +390,9 @@ def report(store: Store, experiment_id: str, samples: list[dict] | None = None) 
         ok = [r for r in rs if r["ok"]]
         judged = [r["judge"] for r in ok if r["judge"] is not None]
         out["arms"][arm] = {
-            "model": rs[0]["model"], "n": len(rs), "errors": len(rs) - len(ok),
+            "model": rs[0]["model"], "n": len(rs),
+            "skipped_budget": sum(1 for r in rs if r["error"] == BUDGET_ERROR),
+            "errors": sum(1 for r in rs if not r["ok"] and r["error"] != BUDGET_ERROR),
             "mean_cost_usd": _mean([r["cost_usd"] for r in ok]), "total_cost_usd": sum(r["cost_usd"] or 0 for r in ok),
             "p50_latency_ms": _p([r["latency_ms"] for r in ok], .5), "p90_latency_ms": _p([r["latency_ms"] for r in ok], .9),
             "cached_share": (sum(r["cached_tokens"] or 0 for r in ok) / max(1, sum(r["prompt_tokens"] or 0 for r in ok))),
@@ -417,12 +437,17 @@ def format_report(rep: dict[str, Any]) -> str:
                 sig = "" if not ci else (" (significant)" if ci[0] > 0 or ci[1] < 0 else " (not significant)")
                 ci_s = f" CI [{ci[0]:+.2f}, {ci[1]:+.2f}]" if ci else ""
                 lines.append(f"    paired vs control, {k}: {v['mean']:+.2f}{ci_s} over {v['n']}{sig}")
+        if a.get("skipped_budget"):
+            lines.append(f"    {a['skipped_budget']} sample(s) skipped: experiment budget exhausted (n above counts them)")
         for e in a.get("judge_errors", []):
             lines.append(f"    judge error: {e}")
     lines += ["", "judge: candidate vs. the logged answer, blind and order-randomized; 1 = better, 0.5 = tie, 0 = worse.",
               "Promotion bar: judge >= 0.45 with 95% CI low >= 0.35 over >= 20 judged samples, paired judge vs",
               "control not significantly worse, json ok >= 0.95, cheaper than control."]
     return "\n".join(lines)
+
+
+_SAFE_ROLE = re.compile(r"^[\w.-]+$")
 
 
 def promotion_snippet(rep: dict[str, Any], role: str | None, min_judged: int = 20, min_score: float = 0.45,
@@ -450,7 +475,12 @@ def promotion_snippet(rep: dict[str, Any], role: str | None, min_judged: int = 2
     if best is None:
         return "# no arm meets the promotion bar (see report); keep the current route"
     arm, a = best
+    if role and not _SAFE_ROLE.match(role):
+        return (f"# arm {arm} meets the bar, but role {role!r} has characters that are unsafe in a route "
+                "condition; write the `when:` expression by hand")
     when = f"metadata.role == '{role}'" if role else "true"
+    from .expr import compile_expr
+    compile_expr(when)  # fail here, not when the policy is loaded
     base = ctl.get("mean_cost_usd") or lg["mean_cost_usd"]
     saving = f"{(1 - a['mean_cost_usd'] / base):.0%}" if base else "?"
     return (f"# proposal from experiment {rep['experiment']}: arm {arm}, judge {a['judge_score']:.2f} over "

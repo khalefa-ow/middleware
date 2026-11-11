@@ -84,6 +84,11 @@ concurrency: 6
 Every arm call goes through the gateway (redaction, size checks, tracing; source `experiment`).
 Replays reuse the caller's recorded params when the gateway recorded them.
 
+`budget_usd` caps the arm calls only; the judge has its own cap (`judge.max_usd`). Calls already in
+flight when a cap is reached still finish, so spend can overshoot by up to `concurrency` calls.
+Samples skipped because the budget ran out get a result row (`error: budget exhausted`) and are
+reported as `skipped_budget`, not as errors.
+
 ### Fine-tuning datasets
 
 ```
@@ -94,7 +99,11 @@ wrapper export-finetune planner-distill --role planner --select experiment:plann
 Writes `NAME.train.jsonl`, `NAME.holdout.jsonl` (OpenAI chat fine-tuning format) and a manifest.
 Prompts and answers are redacted by default (same value, same placeholder in prompt and answer).
 The split is stored, so after tuning, evaluate on unseen prompts with `dataset: {holdout_of: NAME}`;
-the command prints a ready base-vs-tuned spec.
+the command prints a ready base-vs-tuned spec. Examples with images, tool messages or tool calls
+are skipped whole (counted as `non-text`), never exported partly.
+
+With `storage.record_inputs: false` the gateway keeps no prompts, answers or vault values, only
+hashes (so `wrapper delete --value` still finds the requests).
 
 ## Tests
-`.venv/bin/pytest -q` (65 tests, no network: the model is faked at `Wrapper.acompletion`).
+`.venv/bin/pytest -q` (70 tests, no network: the model is faked at `Wrapper.acompletion`).
