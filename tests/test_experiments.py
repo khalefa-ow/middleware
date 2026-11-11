@@ -258,3 +258,62 @@ async def test_limit_override_and_exploratory_label(make_wrapper, store, tmp_pat
     import pytest
     with pytest.raises(ValueError, match="at least 1"):
         ex.load_spec(str(p), limit=0)
+
+
+TRANSFORM_MODULE = '''
+def drop_system(messages):
+    return [m for m in messages if m["role"] != "system"]
+'''
+
+
+async def test_prompt_arms_change_outbound_messages_but_judge_sees_original(make_wrapper, store, tmp_path):
+    _seed(store, 1)
+    (tmp_path / "prompt_t11.txt").write_text("FROM FILE")
+    (tmp_path / "xform_t11.py").write_text(TRANSFORM_MODULE)
+    fake = Scripted()
+    w = make_wrapper(fake)
+    arms = [{"id": "orig", "model": "m0"},
+            {"id": "rep", "model": "m1", "system": "REPLACED"},
+            {"id": "file", "model": "m2", "system_file": "prompt_t11.txt", "system_suffix": "SUFFIX"},
+            {"id": "tr", "model": "m3", "transform": "python:xform_t11:drop_system"}]
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump({"id": "pa", "dataset": {"role": "planner"}, "arms": arms,
+                                 "scorers": ["judge"], "judge": {"model": "judge-m", "max_usd": 5}}))
+    await ex.run_experiment(w, store, str(p))
+    by = {c["model"]: c["messages"] for c in fake.calls if c["model"].startswith("m")}
+    # (the gateway may append its placeholder hint after the arm's own system text)
+    assert by["m0"][0]["content"].startswith("Plan as JSON.")
+    assert by["m1"][0]["role"] == "system" and by["m1"][0]["content"].startswith("REPLACED")
+    assert "Plan as JSON." not in by["m1"][0]["content"]
+    assert by["m2"][0]["content"].startswith("FROM FILE\n\nSUFFIX")
+    assert "Plan as JSON." not in json.dumps(by["m3"])   # the transform dropped the system prompt
+    judge_prompts = [c["messages"][-1]["content"] for c in fake.calls if c["model"] == "judge-m"]
+    assert len(judge_prompts) >= 4   # (Scripted records every call twice)
+    for jp in judge_prompts:   # the judge reads the caller's original request, never an arm's rewrite
+        assert "Plan as JSON." in jp and "REPLACED" not in jp and "FROM FILE" not in jp and "SUFFIX" not in jp
+
+
+def test_prompt_arm_validation_and_missing_system_is_inserted(tmp_path):
+    import pytest
+    with pytest.raises(ValueError, match="either system or system_file"):
+        ex.Spec.model_validate({"id": "x", "arms": [{"id": "a", "model": "m", "system": "s", "system_file": "f"}]})
+    with pytest.raises(ValueError, match="transform must look like"):
+        ex.Spec.model_validate({"id": "x", "arms": [{"id": "a", "model": "m", "transform": "nope"}]})
+    spec = ex.Spec.model_validate({"id": "x", "arms": [{"id": "a", "model": "m", "system": "NEW"}]})
+    smp = {"id": "s1", "input_json": json.dumps([{"role": "user", "content": "hi"}]),
+           "output_json": json.dumps({"content": "y"}), "meta": {}, "params_json": "{}"}
+    msgs, *_ = ex.replay_request(smp, spec.arms[0], "x", ex.ReplayContext(spec, str(tmp_path)))
+    assert msgs[0] == {"role": "system", "content": "NEW"} and msgs[1]["content"] == "hi"
+    bad = ex.Spec.model_validate({"id": "x", "arms": [{"id": "a", "model": "m", "system_file": "missing.txt"}]})
+    with pytest.raises(ValueError, match="cannot read system_file"):
+        ex.ReplayContext(bad, str(tmp_path))
+
+
+def test_example_transform_keeps_first_and_last():
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "examples"))
+    from transforms import keep_first_and_last
+    msgs = [{"role": "system", "content": "s"}] + [{"role": "user" if i % 2 == 0 else "assistant",
+                                                    "content": str(i)} for i in range(10)]
+    out = keep_first_and_last(msgs)
+    assert [m["content"] for m in out] == ["s", "0", "6", "7", "8", "9"]

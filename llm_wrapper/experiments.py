@@ -57,6 +57,9 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+_PLUGIN = re.compile(r"^python:([A-Za-z_][\w.]*):([A-Za-z_]\w*)$")
+
+
 class Dataset(_Strict):
     source: str | None = None
     role: str | None = None
@@ -72,7 +75,22 @@ class Arm(_Strict):
     id: str
     model: str
     params: dict[str, Any] = {}
+    system: str | None = None
+    """Replaces the content of the first system message (adds one if the prompt has none)."""
+    system_file: str | None = None
+    """Same, read from a file (relative to the spec). Not together with ``system``."""
     system_suffix: str | None = None
+    """Appended to the system message, after any replacement."""
+    transform: str | None = None
+    """``python:<module>:<function>``: ``fn(messages) -> messages``, applied last (e.g. trim old turns)."""
+
+    @model_validator(mode="after")
+    def _check_prompt(self) -> "Arm":
+        if self.system is not None and self.system_file is not None:
+            raise ValueError(f"arm {self.id!r}: use either system or system_file, not both")
+        if self.transform is not None and not _PLUGIN.match(self.transform):
+            raise ValueError(f"arm {self.id!r}: transform must look like python:<module>:<function>")
+        return self
 
 
 class Judge(_Strict):
@@ -84,7 +102,6 @@ class Judge(_Strict):
 
 
 BUILTIN_SCORERS = ("json_valid", "similarity", "judge")
-_PLUGIN = re.compile(r"^python:([A-Za-z_][\w.]*):([A-Za-z_]\w*)$")
 
 
 def scorer_name(ref: str) -> str:
@@ -158,32 +175,54 @@ def ensure_schema(store: Store) -> None:
                 c.execute(f"ALTER TABLE experiment_results ADD COLUMN {col} {typ}")
 
 
-def load_plugins(spec: Spec, spec_dir: str) -> dict[str, Any]:
-    """Import ``python:module:function`` scorers. The spec's folder goes first on sys.path.
+def _import_callable(ref: str, spec_dir: str) -> Any:
+    """Import ``python:module:function``. The spec's folder goes first on sys.path.
     Specs run code: only load specs you trust."""
     import importlib
     import sys
 
-    out: dict[str, Any] = {}
-    if not spec.plugin_refs:
-        return out
+    _, mod, fn = ref.split(":")
     d = str(Path(spec_dir).resolve())
     if d not in sys.path:
         sys.path.insert(0, d)
     importlib.invalidate_caches()
-    for ref in spec.plugin_refs:
-        _, mod, fn = ref.split(":")
-        loaded = sys.modules.get(mod)
-        if loaded is not None and not str(getattr(loaded, "__file__", "") or "").startswith(d):
-            del sys.modules[mod]  # same module name from another folder: load this spec's own
-        try:
-            f = getattr(importlib.import_module(mod), fn)
-        except (ImportError, AttributeError) as exc:
-            raise ValueError(f"cannot load scorer {ref!r}: {exc}") from exc
-        if not callable(f):
-            raise ValueError(f"scorer {ref!r} is not callable")
-        out[fn] = f
-    return out
+    loaded = sys.modules.get(mod)
+    if loaded is not None and not str(getattr(loaded, "__file__", "") or "").startswith(d):
+        del sys.modules[mod]  # same module name from another folder: load this spec's own
+    try:
+        f = getattr(importlib.import_module(mod), fn)
+    except (ImportError, AttributeError) as exc:
+        raise ValueError(f"cannot load {ref!r}: {exc}") from exc
+    if not callable(f):
+        raise ValueError(f"{ref!r} is not callable")
+    return f
+
+
+def load_plugins(spec: Spec, spec_dir: str) -> dict[str, Any]:
+    """Scorer plugins by name (the function's name)."""
+    try:
+        return {scorer_name(r): _import_callable(r, spec_dir) for r in spec.plugin_refs}
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("cannot load ", "cannot load scorer ", 1)) from exc
+
+
+class ReplayContext:
+    """Per-spec things an arm needs to build its prompt: system text from files and transform functions."""
+
+    def __init__(self, spec: Spec, spec_dir: str):
+        self.systems: dict[str, str] = {}
+        self.transforms: dict[str, Any] = {}
+        for arm in spec.arms:
+            if arm.system_file is not None:
+                path = Path(spec_dir) / arm.system_file
+                try:
+                    self.systems[arm.id] = path.read_text()
+                except OSError as exc:
+                    raise ValueError(f"arm {arm.id!r}: cannot read system_file {path}: {exc}") from exc
+            elif arm.system is not None:
+                self.systems[arm.id] = arm.system
+            if arm.transform:
+                self.transforms[arm.id] = _import_callable(arm.transform, spec_dir)
 
 
 def load_spec(path: str, limit: int | None = None) -> tuple[Spec, str]:
@@ -301,6 +340,7 @@ class Runner:
         self.judge_spent = 0.0
         self.rng = random.Random(spec.dataset.seed)
         self.plugins = load_plugins(spec, spec_dir)
+        self.ctx = ReplayContext(spec, spec_dir)
         ensure_schema(store)
 
     async def _call(self, model: str, messages: list[dict], params: dict, tag: dict) -> tuple[Any, float]:
@@ -341,7 +381,7 @@ class Runner:
                     "experiment_id": self.spec.id, "arm_id": arm.id, "sample_id": s["id"], "model": arm.model,
                     "ts": time.time(), "ok": 0, "error": BUDGET_ERROR})
                 return
-            messages, params, tag, reference = replay_request(s, arm, self.spec.id)
+            messages, params, tag, reference, original = replay_request(s, arm, self.spec.id, self.ctx)
             row = {"experiment_id": self.spec.id, "arm_id": arm.id, "sample_id": s["id"], "model": arm.model,
                    "ts": time.time()}
             try:
@@ -365,7 +405,7 @@ class Runner:
                 row["scores_json"] = dumps(self._plugin_scores(s, reference, answer))
             if "judge" in self.spec.scorers:
                 row["judge"], row["judge_cost_usd"], row["judge_error"] = await self._judge(
-                    messages, reference, answer, tag)
+                    original, reference, answer, tag)
             self.store.put("experiment_results", row)
 
     def _plugin_scores(self, s: dict, reference: str, answer: str) -> dict[str, Any]:
@@ -418,12 +458,23 @@ def store_conn(store: Store):
         conn.close()
 
 
-def replay_request(s: dict, arm: Arm, experiment_id: str) -> tuple[list[dict], dict, dict, str]:
-    """The exact request an arm sends for a sample: (messages, params, gateway tag, logged answer).
-    Shared by real runs and --dry so a dry run predicts what a real run does."""
-    messages = json.loads(s["input_json"])
+def replay_request(s: dict, arm: Arm, experiment_id: str, ctx: ReplayContext | None = None
+                   ) -> tuple[list[dict], dict, dict, str, list[dict]]:
+    """The exact request an arm sends for a sample:
+    (messages, params, gateway tag, logged answer, the caller's original messages).
+    Shared by real runs and --dry so a dry run predicts what a real run does. The original messages are
+    what the judge must see: an arm may not win by rewriting the question."""
+    original = json.loads(s["input_json"])
+    messages = copy.deepcopy(original)
+    if ctx is not None and arm.id in ctx.systems:
+        messages = _with_system(messages, ctx.systems[arm.id])
     if arm.system_suffix:
         messages = _with_suffix(messages, arm.system_suffix)
+    if ctx is not None and arm.id in ctx.transforms:
+        out = ctx.transforms[arm.id](copy.deepcopy(messages))
+        if not (isinstance(out, list) and out and all(isinstance(m, dict) for m in out)):
+            raise ValueError(f"transform of arm {arm.id!r} must return a non-empty list of messages")
+        messages = out
     reference = (json.loads(s["output_json"]) or {}).get("content") or ""
     tag = {"experiment": experiment_id, "arm": arm.id, "sample": s["id"], "role": s["meta"].get("role")}
     # replay with the caller's recorded params (gateway traffic records them); arm params win
@@ -433,7 +484,16 @@ def replay_request(s: dict, arm: Arm, experiment_id: str) -> tuple[list[dict], d
         params.pop("response_format", None)  # only a recorded schema can be replayed; `true` is a marker
     params.update(arm.params)
     params = {k: v for k, v in params.items() if v is not None}  # arm param `null` removes the param
-    return messages, params, tag, reference
+    return messages, params, tag, reference, original
+
+
+def _with_system(messages: list[dict], text: str) -> list[dict]:
+    msgs = [dict(m) for m in messages]
+    for m in msgs:
+        if m.get("role") == "system":
+            m["content"] = text
+            return msgs
+    return [{"role": "system", "content": text}, *msgs]
 
 
 def _with_suffix(messages: list[dict], suffix: str) -> list[dict]:
@@ -684,6 +744,7 @@ def dry_run(wrapper: Wrapper, store: Store, spec_path: str, limit: int | None = 
     from .privacy import EgressBlocked, NonTextBlocked
 
     spec, _ = load_spec(spec_path, limit)
+    ctx = ReplayContext(spec, str(Path(spec_path).resolve().parent))
     samples = sample(store, spec.dataset)
     if not samples:
         raise ValueError("no recorded calls match the dataset filter")
@@ -693,7 +754,7 @@ def dry_run(wrapper: Wrapper, store: Store, spec_path: str, limit: int | None = 
         a = {"model": arm.model, "samples": 0, "would_fail": {}, "rerouted": 0, "placeholders": [],
              "input_tokens": [], "cost": [], "unpriced": 0}
         for smp in samples:
-            messages, params, tag, _ = replay_request(smp, arm, spec.id)
+            messages, params, tag, *_ = replay_request(smp, arm, spec.id, ctx)
             try:
                 p = wrapper.prepare(messages, dict(params), tag, force_model=arm.model, source="experiment")
             except (size_mod.ContextTooLarge, EgressBlocked, NonTextBlocked) as exc:

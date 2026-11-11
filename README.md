@@ -96,6 +96,15 @@ flight when a cap is reached still finish, so spend can overshoot by up to `conc
 Samples skipped because the budget ran out get a result row (`error: budget exhausted`) and are
 reported as `skipped_budget`, not as errors.
 
+### Prompt and context arms
+
+Besides the model and params, an arm can change the prompt: `system` (replaces the first system
+message, or adds one) or `system_file` (same, read from a file next to the spec; not both), then
+`system_suffix` (appended), then `transform: "python:module:function"` with
+`fn(messages) -> messages` for context strategies such as trimming old turns
+(`examples/transforms.py` has `keep_first_and_last`). The judge always sees the caller's original
+request, so an arm cannot win by rewriting the question. Transforms are Python code: only run specs you trust.
+
 ### Your own scorers
 
 A scorer plugin is a function `fn(sample, answer) -> float | None` (0..1; `None` = not applicable).
@@ -135,4 +144,4 @@ With `storage.record_inputs: false` the gateway keeps no prompts, answers or vau
 hashes (so `wrapper delete --value` still finds the requests).
 
 ## Tests
-`.venv/bin/pytest -q` (79 tests, no network: the model is faked at `Wrapper.acompletion`).
+`.venv/bin/pytest -q` (82 tests, no network: the model is faked at `Wrapper.acompletion`).

@@ -525,3 +525,8 @@ When section 5 is finished (or you stop early), give the user:
   plugins (`scores_json` column, `Spec.primary`, `RESULT_COLUMNS` + `ensure_schema`); `--limit` and the
   "exploratory" label. Deviation: `Spec.scorers` stays a list of strings and a default `primary: judge` is
   allowed without a judge scorer (promotion then finds nothing). 79 tests pass.
+- 2026-11-11: T11 done. Arms take `system` / `system_file` / `system_suffix` / `transform`; `replay_request`
+  returns the caller's original messages as a fifth value and the judge reads those; `ReplayContext` holds
+  system texts and loaded transforms; `examples/transforms.py` added. Note for later tasks: with an untrusted
+  model the gateway appends its placeholder hint to the system message (or inserts one), so tests compare
+  prefixes. 82 tests pass.
