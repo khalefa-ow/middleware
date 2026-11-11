@@ -171,7 +171,11 @@ def cmd_experiment(args) -> int:
         rep = ex.report(st, args.target)
         print(json.dumps(rep, indent=2) if args.json else ex.format_report(rep))
         return 0
-    w = Wrapper(load_policy(args.policy), st, load_key())
+    w = Wrapper(load_policy(args.policy), None if args.dry else st, load_key())
+    if args.dry:
+        d = ex.dry_run(w, st, args.target)
+        print(json.dumps(d, indent=2) if args.json else ex.format_dry_run(d))
+        return 0
     rep = asyncio.run(ex.run_experiment(w, st, args.target))
     if args.json:
         print(json.dumps(rep, indent=2))
@@ -276,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("action", choices=["run", "report"])
     s.add_argument("target", help="spec YAML (run) or experiment id (report)")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--dry", action="store_true", help="run: estimate only; no model calls, nothing stored")
     s.set_defaults(fn=cmd_experiment)
 
     s = sub.add_parser("export-finetune", help="export recorded calls as a fine-tuning dataset (train + holdout)")

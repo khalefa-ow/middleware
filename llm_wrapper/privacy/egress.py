@@ -107,6 +107,14 @@ def redact_payload(messages: list[dict], tools: list[dict] | None, vault: Vault,
     return msgs, new_tools, report
 
 
+def redact_response_format(rf: Any, vault: Vault, detector: Detector, report: RedactionReport) -> Any:
+    """Redact descriptions and enum values in a response_format JSON schema (it is sent to the model)."""
+    if not isinstance(rf, dict):
+        return rf
+    fn = lambda s: redact_text(s, vault, detector, report)  # noqa: E731
+    return _redact_json_strings(copy.deepcopy(rf), ("description",), fn)
+
+
 def leak_check(payload: Any, vault: Vault) -> list[str]:
     """Return placeholders whose real value still appears in the outbound payload."""
     blob = json.dumps(payload, ensure_ascii=False, default=str)

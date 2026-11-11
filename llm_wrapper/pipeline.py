@@ -24,7 +24,8 @@ from . import size as size_mod
 from .expr import evaluate
 from .policy import LoadedPolicy
 from .privacy import (Detector, EgressBlocked, RedactionReport, RestoreReport, StreamRestorer,
-                      Vault, add_hint, leak_check, redact_payload, restore_text, value_hash)
+                      Vault, add_hint, leak_check, redact_payload, redact_response_format, restore_text,
+                      value_hash)
 from .storage import Store, dumps
 
 _DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("wrapper_depth", default=0)
@@ -56,6 +57,8 @@ class Prepared:
     caller_messages: list[dict]
     caller_metadata: dict[str, Any]
     source: str = "own_live"
+    caller_response_format: Any = None
+    """The caller's response_format as given; ``params`` holds the redacted copy that is sent."""
     spans: list[dict] = field(default_factory=list)
 
 
@@ -118,19 +121,20 @@ class Wrapper:
         return self.policy.models.default, "default"
 
     # ------------------------------------------------------------ prepare
-    def _guard(self, messages, tools, model: str, vault: Vault):
+    def _guard(self, messages, tools, model: str, vault: Vault, response_format: Any = None):
         trusted = self.policy.is_trusted(model)
         pv = self.policy.privacy
         if trusted or not pv.enabled:
-            return messages, tools, RedactionReport(), trusted
+            return messages, tools, response_format, RedactionReport(), trusted
         msgs, tls, report = redact_payload(messages, tools, vault, self.detector, pv.non_text, trusted)
+        rf = redact_response_format(response_format, vault, self.detector, report)
         if len(vault) and pv.placeholder_hint:
             msgs = add_hint(msgs)
         if pv.leak_check:
-            hits = leak_check({"messages": msgs, "tools": tls}, vault)
+            hits = leak_check({"messages": msgs, "tools": tls, "response_format": rf}, vault)
             if hits:
                 raise EgressBlocked(f"leak check blocked the call to {model}: {len(hits)} value(s) still present")
-        return msgs, tls, report, trusted
+        return msgs, tls, rf, report, trusted
 
     def prepare(self, messages: list[dict], params: dict[str, Any], metadata: dict[str, Any],
                 force_model: str | None = None, source: str = "own_live") -> Prepared:
@@ -150,14 +154,17 @@ class Wrapper:
         tools = params.get("tools")
         fwd = {k: v for k, v in params.items() if k not in _IGNORED_PARAMS and k != "tools"}
 
-        msgs, tls, report, trusted = self._guard(messages, tools, model, vault)
+        caller_rf = fwd.get("response_format")
+        msgs, tls, rf, report, trusted = self._guard(messages, tools, model, vault, caller_rf)
         sc = size_mod.check(model, msgs, tls, self.policy, fwd.get("max_tokens"))
         if sc.model != model:  # rerouted: redo the guard if trust differs
             model = sc.model
             if self.policy.is_trusted(model) != trusted:
-                msgs, tls, report, trusted = self._guard(messages, tools, model, vault)
+                msgs, tls, rf, report, trusted = self._guard(messages, tools, model, vault, caller_rf)
+        if "response_format" in fwd:
+            fwd = {**fwd, "response_format": rf}
         return Prepared(rid, started, skey, model, route_id, trusted, msgs, tls, fwd, vault, report, sc,
-                        messages, metadata, source)
+                        messages, metadata, source, caller_rf)
 
     # ------------------------------------------------------------ call
     async def _call(self, p: Prepared, messages: list[dict], **extra: Any) -> Any:
@@ -315,7 +322,7 @@ class Wrapper:
             "input_json": dumps(p.caller_messages) if rec else None,
             "output_json": dumps(resp.choices[0].message.model_dump()) if (rec and resp is not None) else None,
             "params_json": dumps({k: v for k, v in p.params.items() if k != "response_format"}
-                                 | ({"response_format": True} if "response_format" in p.params else {})),
+                                 | self._recorded_response_format(p, rec)),
             "metadata_json": dumps(p.caller_metadata | {"wrapper": info}),
             "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
             "cached_tokens": usage.get("cached_tokens"), "cost_usd": cost, "latency_ms": (time.time() - p.started) * 1000,
@@ -341,6 +348,14 @@ class Wrapper:
                              "value_hash": vh, "type": e.type, "origin": e.origin,
                              "key_version": p.vault.key_version, "created": time.time()})
             st.put("vault_refs", {"value_hash": vh, "request_id": p.request_id})
+
+    @staticmethod
+    def _recorded_response_format(p: Prepared, rec: bool) -> dict[str, Any]:
+        """The caller's own schema when inputs are recorded (so replays are faithful), else just a marker."""
+        if "response_format" not in p.params:
+            return {}
+        rf = p.caller_response_format
+        return {"response_format": rf if (rec and isinstance(rf, dict)) else True}
 
     def _record_failed_prepare(self, messages, params, metadata, exc: Exception) -> None:
         # never store the raw input of a request we refused for privacy reasons

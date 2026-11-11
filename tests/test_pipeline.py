@@ -251,3 +251,48 @@ async def test_stream_refused_before_model_call_is_recorded(make_wrapper, store)
     store.flush()
     rows = store.query("SELECT * FROM requests")
     assert len(rows) == 1 and rows[0]["error"].startswith("ContextTooLarge") and rows[0]["input_json"] is None
+
+
+async def test_response_format_dict_is_recorded_as_given(make_wrapper, store):
+    schema = {"type": "json_schema", "json_schema": {"name": "p", "schema": {"type": "object"}}}
+    w = make_wrapper(FakeModel())
+    await w.acomplete([{"role": "user", "content": "x"}], {"response_format": schema}, {})
+    store.flush()
+    assert json.loads(store.query("SELECT params_json FROM requests")[0]["params_json"])["response_format"] == schema
+    w2 = make_wrapper(FakeModel(), storage={"record_inputs": False})
+    await w2.acomplete([{"role": "user", "content": "y"}], {"response_format": schema}, {})
+    store.flush()
+    marks = [json.loads(r["params_json"])["response_format"] for r in store.query("SELECT params_json FROM requests")]
+    assert True in marks
+
+
+async def test_response_format_schema_is_redacted_for_untrusted_model_only(make_wrapper, store):
+    schema = {"type": "json_schema", "json_schema": {"name": "p", "schema": {
+        "type": "object", "description": "mail jane@acme.com",
+        "properties": {"to": {"type": "string", "enum": ["jane@acme.com", "bob@other.org"]}}}}}
+    fake = FakeModel()
+    w = make_wrapper(fake)
+    await w.acomplete([{"role": "user", "content": "hi"}], {"response_format": schema}, {})
+    sent = json.dumps(fake.calls[0]["response_format"])
+    assert "jane@acme.com" not in sent and "bob@other.org" not in sent and "<EMAIL_" in sent
+    store.flush()
+    rec = json.loads(store.query("SELECT params_json FROM requests")[0]["params_json"])["response_format"]
+    assert rec == schema  # the caller's original is what gets recorded
+    fake2 = FakeModel()
+    w2 = make_wrapper(fake2, privacy={"trusted": ["openai/gpt-4o-mini"]})
+    await w2.acomplete([{"role": "user", "content": "hi"}], {"response_format": schema}, {})
+    assert fake2.calls[0]["response_format"] == schema
+
+
+async def test_response_format_leak_check_and_reroute_guard(make_wrapper):
+    # a value that appears only in the schema is found by the guard on the rerouted model too
+    schema = {"type": "json_schema", "json_schema": {"name": "p", "schema": {
+        "type": "object", "properties": {"to": {"enum": ["jane@acme.com"]}}}}}
+    fake = FakeModel()
+    w = make_wrapper(fake, models={"default": "openai/gpt-4o-mini", "large_context": ["openai/gpt-4.1"]},
+                     size={"limits": {"openai/gpt-4o-mini": 1000}, "reserve_output_tokens": 100},
+                     privacy={"trusted": ["openai/gpt-4o-mini"]})
+    big = [{"role": "user", "content": "word " * 3000}]
+    await w.acomplete(big, {"response_format": schema}, {})
+    assert fake.calls[0]["model"] == "openai/gpt-4.1"   # rerouted to an untrusted model
+    assert "jane@acme.com" not in json.dumps(fake.calls[0]["response_format"])

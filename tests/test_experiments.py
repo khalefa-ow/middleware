@@ -131,3 +131,48 @@ async def test_promotion_refuses_unsafe_role(make_wrapper, store, tmp_path):
     assert "routes:" in ex.promotion_snippet(rep, "planner")
     out = ex.promotion_snippet(rep, "it's")
     assert "routes:" not in out and "by hand" in out
+
+
+async def test_replay_forwards_recorded_schema_and_arm_null_removes_it(make_wrapper, store, tmp_path):
+    schema = {"type": "json_schema", "json_schema": {"name": "plan", "schema": {"type": "object"}}}
+    store.put("requests", {"id": "live2", "ts": 1, "source": "own_live", "model_used": "openai/gpt-4o",
+                           "input_json": json.dumps([{"role": "user", "content": "x"}]),
+                           "output_json": json.dumps({"role": "assistant", "content": "y"}),
+                           "params_json": json.dumps({"response_format": schema}), "metadata_json": "{}"})
+    store.flush()
+    fake = FakeModel()
+    w = make_wrapper(fake)
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump({"id": "e2", "dataset": {"source": "own_live"},
+                                 "arms": [{"id": "keep", "model": "m1"},
+                                          {"id": "drop", "model": "m2", "params": {"response_format": None}}]}))
+    await ex.run_experiment(w, store, str(p))
+    by_model = {c["model"]: c for c in fake.calls}
+    assert by_model["m1"]["response_format"] == schema
+    assert "response_format" not in by_model["m2"]
+
+
+def test_dry_run_calls_nothing_writes_nothing_and_reports_estimates(make_wrapper, store, tmp_path):
+    _seed(store, 3)
+    store.put("requests", {"id": "huge", "ts": 20, "source": "own_import", "model_used": "openai/gpt-4o",
+                           "input_json": json.dumps([{"role": "user", "content": "word " * 3000}]),
+                           "output_json": json.dumps({"role": "assistant", "content": "{}"}),
+                           "metadata_json": json.dumps({"role": "planner", "parse_ok": True})})
+    store.flush()
+    fake = FakeModel()
+    w = make_wrapper(fake, size={"limits": {"openai/gpt-4o-mini": 1000}, "reserve_output_tokens": 100})
+    p = tmp_path / "d.yaml"
+    p.write_text(yaml.safe_dump({"id": "dry", "dataset": {"role": "planner"}, "scorers": ["judge"],
+                                 "judge": {"model": "j", "max_usd": 0.25},
+                                 "arms": [{"id": "mini", "model": "openai/gpt-4o-mini"}]}))
+    d = ex.dry_run(w, store, str(p))
+    a = d["arms"]["mini"]
+    assert fake.calls == []
+    assert a["samples"] == 3 and a["would_fail"] == {"ContextTooLarge": 1}
+    assert a["mean_input_tokens"] > 0 and a["mean_cost_usd"] > 0 and a["mean_placeholders"] >= 1
+    assert d["judge_max_usd"] == 0.25 and "estimates" in ex.format_dry_run(d)
+    store.flush()
+    assert store.query("SELECT count(*) AS n FROM requests WHERE source='experiment'")[0]["n"] == 0
+    tables = {r["name"] for r in store.query("SELECT name FROM sqlite_master WHERE type='table'")}
+    for t in ("experiment_results", "experiments"):  # not even created by a dry run
+        assert t not in tables or store.query(f"SELECT count(*) AS n FROM {t}")[0]["n"] == 0

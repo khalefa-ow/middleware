@@ -23,6 +23,9 @@ Example spec:
     budget_usd: 1.00
     concurrency: 4
 
+Replays reuse the caller's recorded params, including a recorded ``response_format`` schema.
+An arm param whose value is ``null`` removes that param (e.g. ``params: {response_format: null}``).
+
 Budgets: ``budget_usd`` caps the arm calls only; the judge has its own cap (``judge.max_usd``).
 Calls already in flight when a cap is reached still finish, so spend can overshoot by up to
 ``concurrency`` calls. Samples not run because the budget was spent get a result row with
@@ -253,15 +256,7 @@ class Runner:
                     "experiment_id": self.spec.id, "arm_id": arm.id, "sample_id": s["id"], "model": arm.model,
                     "ts": time.time(), "ok": 0, "error": BUDGET_ERROR})
                 return
-            messages = json.loads(s["input_json"])
-            if arm.system_suffix:
-                messages = _with_suffix(messages, arm.system_suffix)
-            reference = (json.loads(s["output_json"]) or {}).get("content") or ""
-            tag = {"experiment": self.spec.id, "arm": arm.id, "sample": s["id"], "role": s["meta"].get("role")}
-            # replay with the caller's recorded params (gateway traffic records them); arm params win
-            params = {k: v for k, v in json.loads(s.get("params_json") or "{}").items()
-                      if k not in ("response_format", "metadata", "stream", "stream_options", "timeout")}
-            params.update(arm.params)
+            messages, params, tag, reference = replay_request(s, arm, self.spec.id)
             row = {"experiment_id": self.spec.id, "arm_id": arm.id, "sample_id": s["id"], "model": arm.model,
                    "ts": time.time()}
             try:
@@ -312,6 +307,24 @@ def store_conn(store: Store):
             yield conn
     finally:
         conn.close()
+
+
+def replay_request(s: dict, arm: Arm, experiment_id: str) -> tuple[list[dict], dict, dict, str]:
+    """The exact request an arm sends for a sample: (messages, params, gateway tag, logged answer).
+    Shared by real runs and --dry so a dry run predicts what a real run does."""
+    messages = json.loads(s["input_json"])
+    if arm.system_suffix:
+        messages = _with_suffix(messages, arm.system_suffix)
+    reference = (json.loads(s["output_json"]) or {}).get("content") or ""
+    tag = {"experiment": experiment_id, "arm": arm.id, "sample": s["id"], "role": s["meta"].get("role")}
+    # replay with the caller's recorded params (gateway traffic records them); arm params win
+    params = {k: v for k, v in json.loads(s.get("params_json") or "{}").items()
+              if k not in ("metadata", "stream", "stream_options", "timeout")}
+    if not isinstance(params.get("response_format"), dict):
+        params.pop("response_format", None)  # only a recorded schema can be replayed; `true` is a marker
+    params.update(arm.params)
+    params = {k: v for k, v in params.items() if v is not None}  # arm param `null` removes the param
+    return messages, params, tag, reference
 
 
 def _with_suffix(messages: list[dict], suffix: str) -> list[dict]:
@@ -496,3 +509,65 @@ async def run_experiment(wrapper: Wrapper, store: Store, spec_path: str) -> dict
     rep["promotion"] = promotion_snippet(rep, spec.dataset.role)
     rep["experiment_cost_usd"] = runner.spent + runner.judge_spent
     return rep
+
+
+def dry_run(wrapper: Wrapper, store: Store, spec_path: str) -> dict[str, Any]:
+    """What a run would do, without calling any model or writing anything: per arm, how many samples
+    the gateway would refuse or reroute, placeholders, and token and cost estimates. Estimates use list
+    prices with no cache discount and the logged answer's length as the output length."""
+    import litellm
+
+    from . import size as size_mod
+    from .privacy import EgressBlocked, NonTextBlocked
+
+    spec, _ = load_spec(spec_path)
+    samples = sample(store, spec.dataset)
+    if not samples:
+        raise ValueError("no recorded calls match the dataset filter")
+    out: dict[str, Any] = {"experiment": spec.id, "samples": len(samples), "arms": {},
+                           "judge_max_usd": spec.judge.max_usd if "judge" in spec.scorers and spec.judge else 0.0}
+    for arm in spec.arms:
+        a = {"model": arm.model, "samples": 0, "would_fail": {}, "rerouted": 0, "placeholders": [],
+             "input_tokens": [], "cost": [], "unpriced": 0}
+        for smp in samples:
+            messages, params, tag, _ = replay_request(smp, arm, spec.id)
+            try:
+                p = wrapper.prepare(messages, dict(params), tag, force_model=arm.model, source="experiment")
+            except (size_mod.ContextTooLarge, EgressBlocked, NonTextBlocked) as exc:
+                k = type(exc).__name__
+                a["would_fail"][k] = a["would_fail"].get(k, 0) + 1
+                continue
+            a["samples"] += 1
+            a["rerouted"] += int(p.model != arm.model)
+            a["placeholders"].append(len(p.vault))
+            n_in = size_mod.count_tokens(p.model, p.messages, p.tools)
+            a["input_tokens"].append(n_in)
+            try:
+                pin, pout = litellm.cost_per_token(model=p.model, prompt_tokens=n_in,
+                                                   completion_tokens=smp.get("completion_tokens") or 0)
+                a["cost"].append(pin + pout)
+            except Exception:
+                a["unpriced"] += 1
+        a["mean_placeholders"] = _mean(a.pop("placeholders"))
+        a["mean_input_tokens"] = _mean(a.pop("input_tokens"))
+        costs = a.pop("cost")
+        a["mean_cost_usd"] = _mean(costs)
+        a["total_cost_usd"] = sum(costs) if costs else None
+        out["arms"][arm.id] = a
+    return out
+
+
+def format_dry_run(d: dict[str, Any]) -> str:
+    f = lambda x, n=4: "-" if x is None else f"{x:.{n}f}"  # noqa: E731
+    lines = [f"# Dry run {d['experiment']} ({d['samples']} samples) - estimates only, nothing was sent or stored",
+             "arm | model | would run | would fail | rerouted | placeholders | input tokens | est. mean $ | est. total $"]
+    for arm, a in d["arms"].items():
+        fails = ", ".join(f"{k} {v}" for k, v in a["would_fail"].items()) or "0"
+        lines.append(" | ".join([arm, a["model"], str(a["samples"]), fails, str(a["rerouted"]),
+                                 f(a["mean_placeholders"], 1), f(a["mean_input_tokens"], 0),
+                                 f(a["mean_cost_usd"], 5), f(a["total_cost_usd"])]
+                                + ([f"({a['unpriced']} unpriced)"] if a["unpriced"] else [])))
+    if d["judge_max_usd"]:
+        lines.append(f"judge worst case: ${d['judge_max_usd']:.2f} (judge.max_usd)")
+    lines.append("estimates: list prices, no cache discount, output length = the logged answer's length.")
+    return "\n".join(lines)
